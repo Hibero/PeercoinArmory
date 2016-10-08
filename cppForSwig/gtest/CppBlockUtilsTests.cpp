@@ -9,216 +9,439 @@
 #include "../BlockObj.h"
 #include "../StoredBlockObj.h"
 #include "../PartialMerkle.h"
-#include "../leveldb_wrapper.h"
+#include "../EncryptionUtils.h"
+#include "../lmdb_wrapper.h"
 #include "../BlockUtils.h"
+#include "../ScrAddrObj.h"
+#include "../BtcWallet.h"
+#include "../BlockDataViewer.h"
+#include "../cryptopp/DetSign.h"
+#include "../cryptopp/integer.h"
+#include "../Progress.h"
+#include "../reorgTest/blkdata.h"
+#include "../txio.h"
+
+#include <thread>
+
 
 #ifdef _MSC_VER
+   #ifdef mlock
+      #undef mlock
+      #undef munlock
+   #endif
    #include "win32_posix.h"
+	#undef close
+
+   #ifdef _DEBUG
+      //#define _CRTDBG_MAP_ALLOC
+      #include <stdlib.h>
+      #include <crtdbg.h>
+      
+      #ifndef DBG_NEW
+         #define DBG_NEW new ( _NORMAL_BLOCK , __FILE__ , __LINE__ )
+         #define new DBG_NEW
+      #endif
+   #endif
 #endif
 
 #define READHEX BinaryData::CreateFromHex
-#define TheBDM BlockDataManager_LevelDB::GetInstance()
 
+#define TheBDM (*theBDM)
 
-/* This didn't work at all
-class BitcoinEnvironment : public ::testing::Environment 
+static uint32_t getTopBlockHeightInDB(BlockDataManager_LevelDB &bdm, DB_SELECT db)
 {
-public:
-   // Override this to define how to set up the environment.
-   virtual void SetUp() 
-   {
-      rawHead_ = READHEX(
-         "01000000"
-         "1d8f4ec0443e1f19f305e488c1085c95de7cc3fd25e0d2c5bb5d000000000000"
-         "9762547903d36881a86751f3f5049e23050113f779735ef82734ebf0b4450081"
-         "d8c8c84d"
-         "b3936a1a"
-         "334b035b");
-      headHashLE_ = READHEX(
-         "1195e67a7a6d0674bbd28ae096d602e1f038c8254b49dfe79d47000000000000");
-      headHashBE_ = READHEX(
-         "000000000000479de7df494b25c838f0e102d696e08ad2bb74066d7a7ae69511");
+   StoredDBInfo sdbi;
+   bdm.getIFace()->getStoredDBInfo(db, sdbi, false); 
+   return sdbi.topBlkHgt_;
+}
 
-      rawTx0_ = READHEX( 
-         "01000000016290dce984203b6a5032e543e9e272d8bce934c7de4d15fa0fe44d"
-         "d49ae4ece9010000008b48304502204f2fa458d439f957308bca264689aa175e"
-         "3b7c5f78a901cb450ebd20936b2c500221008ea3883a5b80128e55c9c6070aa6"
-         "264e1e0ce3d18b7cd7e85108ce3d18b7419a0141044202550a5a6d3bb81549c4"
-         "a7803b1ad59cdbba4770439a4923624a8acfc7d34900beb54a24188f7f0a4068"
-         "9d905d4847cc7d6c8d808a457d833c2d44ef83f76bffffffff0242582c0a0000"
-         "00001976a914c1b4695d53b6ee57a28647ce63e45665df6762c288ac80d1f008"
-         "000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac0000"
-         "0000");
-      rawTx1_ = READHEX( 
-         "0100000001f658dbc28e703d86ee17c9a2d3b167a8508b082fa0745f55be5144"
-         "a4369873aa010000008c49304602210041e1186ca9a41fdfe1569d5d807ca7ff"
-         "6c5ffd19d2ad1be42f7f2a20cdc8f1cc0221003366b5d64fe81e53910e156914"
-         "091d12646bc0d1d662b7a65ead3ebe4ab8f6c40141048d103d81ac9691cf13f3"
-         "fc94e44968ef67b27f58b27372c13108552d24a6ee04785838f34624b294afee"
-         "83749b64478bb8480c20b242c376e77eea2b3dc48b4bffffffff0200e1f50500"
-         "0000001976a9141b00a2f6899335366f04b277e19d777559c35bc888ac40aeeb"
-         "02000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac00"
-         "000000");
+static uint64_t getDBBalanceForHash160(
+   BlockDataManager_LevelDB &bdm,
+   BinaryDataRef addr160
+)
+{
+   StoredScriptHistory ssh;
 
-      rawBlock_ = READHEX(
-         "01000000eb10c9a996a2340a4d74eaab41421ed8664aa49d18538bab59010000"
-         "000000005a2f06efa9f2bd804f17877537f2080030cadbfa1eb50e02338117cc"
-         "604d91b9b7541a4ecfbb0a1a64f1ade703010000000100000000000000000000"
-         "00000000000000000000000000000000000000000000ffffffff0804cfbb0a1a"
-         "02360affffffff0100f2052a01000000434104c2239c4eedb3beb26785753463"
-         "be3ec62b82f6acd62efb65f452f8806f2ede0b338e31d1f69b1ce449558d7061"
-         "aa1648ddc2bf680834d3986624006a272dc21cac000000000100000003e8caa1"
-         "2bcb2e7e86499c9de49c45c5a1c6167ea4b894c8c83aebba1b6100f343010000"
-         "008c493046022100e2f5af5329d1244807f8347a2c8d9acc55a21a5db769e927"
-         "4e7e7ba0bb605b26022100c34ca3350df5089f3415d8af82364d7f567a6a297f"
-         "cc2c1d2034865633238b8c014104129e422ac490ddfcb7b1c405ab9fb4244124"
-         "6c4bca578de4f27b230de08408c64cad03af71ee8a3140b40408a7058a1984a9"
-         "f246492386113764c1ac132990d1ffffffff5b55c18864e16c08ef9989d31c7a"
-         "343e34c27c30cd7caa759651b0e08cae0106000000008c4930460221009ec9aa"
-         "3e0caf7caa321723dea561e232603e00686d4bfadf46c5c7352b07eb00022100"
-         "a4f18d937d1e2354b2e69e02b18d11620a6a9332d563e9e2bbcb01cee559680a"
-         "014104411b35dd963028300e36e82ee8cf1b0c8d5bf1fc4273e970469f5cb931"
-         "ee07759a2de5fef638961726d04bd5eb4e5072330b9b371e479733c942964bb8"
-         "6e2b22ffffffff3de0c1e913e6271769d8c0172cea2f00d6d3240afc3a20f9fa"
-         "247ce58af30d2a010000008c493046022100b610e169fd15ac9f60fe2b507529"
-         "281cf2267673f4690ba428cbb2ba3c3811fd022100ffbe9e3d71b21977a8e97f"
-         "de4c3ba47b896d08bc09ecb9d086bb59175b5b9f03014104ff07a1833fd8098b"
-         "25f48c66dcf8fde34cbdbcc0f5f21a8c2005b160406cbf34cc432842c6b37b25"
-         "90d16b165b36a3efc9908d65fb0e605314c9b278f40f3e1affffffff0240420f"
-         "00000000001976a914adfa66f57ded1b655eb4ccd96ee07ca62bc1ddfd88ac00"
-         "7d6a7d040000001976a914981a0c9ae61fa8f8c96ae6f8e383d6e07e77133e88"
-         "ac00000000010000000138e7586e0784280df58bd3dc5e3d350c9036b1ec4107"
-         "951378f45881799c92a4000000008a47304402207c945ae0bbdaf9dadba07bdf"
-         "23faa676485a53817af975ddf85a104f764fb93b02201ac6af32ddf597e610b4"
-         "002e41f2de46664587a379a0161323a85389b4f82dda014104ec8883d3e4f7a3"
-         "9d75c9f5bb9fd581dc9fb1b7cdf7d6b5a665e4db1fdb09281a74ab138a2dba25"
-         "248b5be38bf80249601ae688c90c6e0ac8811cdb740fcec31dffffffff022f66"
-         "ac61050000001976a914964642290c194e3bfab661c1085e47d67786d2d388ac"
-         "2f77e200000000001976a9141486a7046affd935919a3cb4b50a8a0c233c286c"
-         "88ac00000000");
+   bdm.getIFace()->getStoredScriptHistory(ssh, HASH160PREFIX + addr160);
+   if(!ssh.isInitialized())
+      return 0;
 
-      rawTxUnfrag_ = READHEX(
-         // Version
-         "01000000"
-         // NumTxIn
-         "02"
-         // Start TxIn0
-         "0044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0"
-         "ebf6a69324010000008a47304402206568144ed5e7064d6176c74738b04c08ca"
-         "19ca54ddeb480084b77f45eebfe57802207927d6975a5ac0e1bb36f5c05356dc"
-         "da1f521770511ee5e03239c8e1eecf3aed0141045d74feae58c4c36d7c35beac"
-         "05eddddc78b3ce4b02491a2eea72043978056a8bc439b99ddaad327207b09ef1"
-         "6a8910828e805b0cc8c11fba5caea2ee939346d7ffffffff"
-         // Start TxIn1
-         "45c866b219b17695"
-         "2508f8e5aea728f950186554fc4a5807e2186a8e1c4009e5000000008c493046"
-         "022100bd5d41662f98cfddc46e86ea7e4a3bc8fe9f1dfc5c4836eaf7df582596"
-         "cfe0e9022100fc459ae4f59b8279d679003b88935896acd10021b6e2e4619377"
-         "e336b5296c5e014104c00bab76a708ba7064b2315420a1c533ca9945eeff9754"
-         "cdc574224589e9113469b4e71752146a10028079e04948ecdf70609bf1b9801f"
-         "6b73ab75947ac339e5ffffffff"
-         // NumTxOut
-         "02"
-         // Start TxOut0
-         "ac4c8bd5000000001976a9148dce8946f1c7763bb60ea5cf16ef514cbed0633b88ac"
-         // Start TxOut1
-         "002f6859000000001976a9146a59ac0e8f553f292dfe5e9f3aaa1da93499c15e88ac"
-         // Locktime
-         "00000000");
-
-      rawTxFragged_ = READHEX(
-         //"01000000020044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0"
-         //"ebf6a69324010000008a47304402206568144ed5e7064d6176c74738b04c08ca"
-         //"19ca54ddeb480084b77f45eebfe57802207927d6975a5ac0e1bb36f5c05356dc"
-         //"da1f521770511ee5e03239c8e1eecf3aed0141045d74feae58c4c36d7c35beac"
-         //"05eddddc78b3ce4b02491a2eea72043978056a8bc439b99ddaad327207b09ef1"
-         //"6a8910828e805b0cc8c11fba5caea2ee939346d7ffffffff45c866b219b17695"
-         //"2508f8e5aea728f950186554fc4a5807e2186a8e1c4009e5000000008c493046"
-         //"022100bd5d41662f98cfddc46e86ea7e4a3bc8fe9f1dfc5c4836eaf7df582596"
-         //"cfe0e9022100fc459ae4f59b8279d679003b88935896acd10021b6e2e4619377"
-         //"e336b5296c5e014104c00bab76a708ba7064b2315420a1c533ca9945eeff9754"
-         //"cdc574224589e9113469b4e71752146a10028079e04948ecdf70609bf1b9801f"
-         //"6b73ab75947ac339e5ffffffff0200000000");
-         // Version
-         "01000000"
-         // NumTxIn
-         "02"
-         // Start TxIn0
-         "0044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0"
-         "ebf6a69324010000008a47304402206568144ed5e7064d6176c74738b04c08ca"
-         "19ca54ddeb480084b77f45eebfe57802207927d6975a5ac0e1bb36f5c05356dc"
-         "da1f521770511ee5e03239c8e1eecf3aed0141045d74feae58c4c36d7c35beac"
-         "05eddddc78b3ce4b02491a2eea72043978056a8bc439b99ddaad327207b09ef1"
-         "6a8910828e805b0cc8c11fba5caea2ee939346d7ffffffff"
-         // Start TxIn1
-         "45c866b219b17695"
-         "2508f8e5aea728f950186554fc4a5807e2186a8e1c4009e5000000008c493046"
-         "022100bd5d41662f98cfddc46e86ea7e4a3bc8fe9f1dfc5c4836eaf7df582596"
-         "cfe0e9022100fc459ae4f59b8279d679003b88935896acd10021b6e2e4619377"
-         "e336b5296c5e014104c00bab76a708ba7064b2315420a1c533ca9945eeff9754"
-         "cdc574224589e9113469b4e71752146a10028079e04948ecdf70609bf1b9801f"
-         "6b73ab75947ac339e5ffffffff"
-         // NumTxOut
-         "02"
-         // ... TxOuts fragged out 
-         // Locktime
-         "00000000");
-
-      rawTxOut0_ = READHEX(
-         // Value
-         "ac4c8bd500000000"
-         // Script size (var_int)
-         "19"
-         // Script
-         "76""a9""14""8dce8946f1c7763bb60ea5cf16ef514cbed0633b""88""ac");
-      rawTxOut1_ = READHEX(
-         // Value 
-         "002f685900000000"
-         // Script size (var_int)
-         "19"
-         // Script
-         "76""a9""14""6a59ac0e8f553f292dfe5e9f3aaa1da93499c15e""88""ac");
-
-      bh_.unserialize(rawHead_);
-      tx1_.unserialize(rawTx0_);
-      tx2_.unserialize(rawTx1_);
+   return ssh.getScriptBalance();
+}
 
 
-      sbh_.unserialize(rawHead_);
-
-      // Make sure the global DB type and prune type are reset for each test
-      DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
-   }
-
-   BinaryData rawHead_;
-   BinaryData headHashLE_;
-   BinaryData headHashBE_;
-
-   BinaryData rawBlock_;
-
-   BinaryData rawTx0_;
-   BinaryData rawTx1_;
-
-   BlockHeader bh_;
-   Tx tx1_;
-   Tx tx2_;
-
-   BinaryData rawTxUnfrag_;
-   BinaryData rawTxFragged_;
-   BinaryData rawTxOut0_;
-   BinaryData rawTxOut1_;
-
-   StoredHeader sbh_;
-
-};
-
-
-::testing::Environment* const btcenv = 
-               ::testing::AddGlobalTestEnvironment(new BitcoinEnvironment);
+/*
+unused
+static uint32_t getAppliedToHeightInDB(BlockDataManager_LevelDB &bdm)
+{
+   StoredDBInfo sdbi;
+   bdm.getIFace()->getStoredDBInfo(BLKDATA, sdbi, false); 
+   return sdbi.appliedToHgt_;
+}
 */
 
+// Utility function - Clean up comments later
+static int char2int(char input)
+{
+  if(input >= '0' && input <= '9')
+    return input - '0';
+  if(input >= 'A' && input <= 'F')
+    return input - 'A' + 10;
+  if(input >= 'a' && input <= 'f')
+    return input - 'a' + 10;
+  return 0;
+}
 
+// This function assumes src to be a zero terminated sanitized string with
+// an even number of [0-9a-f] characters, and target to be sufficiently large
+static void hex2bin(const char* src, unsigned char* target)
+{
+  while(*src && src[1])
+  {
+    *(target++) = char2int(*src)*16 + char2int(src[1]);
+    src += 2;
+  }
+}
+
+#if ! defined(_MSC_VER) && ! defined(__MINGW32__)
+/////////////////////////////////////////////////////////////////////////////
+static void rmdir(string src)
+{
+   char* syscmd = new char[4096];
+   sprintf(syscmd, "rm -rf %s", src.c_str());
+   system(syscmd);
+   delete[] syscmd;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+static void mkdir(string newdir)
+{
+   char* syscmd = new char[4096];
+   sprintf(syscmd, "mkdir -p %s", newdir.c_str());
+   system(syscmd);
+   delete[] syscmd;
+}
+#endif
+
+static void concatFile(const string &from, const string &to)
+{
+   std::ifstream i(from, ios::binary);
+   std::ofstream o(to, ios::app | ios::binary);
+
+   o << i.rdbuf();
+}
+
+static void appendBlocks(const std::vector<std::string> &files, const std::string &to)
+{
+   for (const std::string &f : files)
+      concatFile("../reorgTest/blk_" + f + ".dat", to);
+}
+
+static void setBlocks(const std::vector<std::string> &files, const std::string &to)
+{
+   std::ofstream o(to, ios::trunc | ios::binary);
+   o.close();
+   
+   for (const std::string &f : files)
+      concatFile("../reorgTest/blk_" + f + ".dat", to);
+}
+
+static void nullProgress(unsigned, double, unsigned, unsigned)
+{
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Test any custom Crypto++ code we've written.
+// Deterministic signing vectors taken from RFC6979. (NOT TRUE JUST YET!)
+class CryptoPPTest : public ::testing::Test
+{
+protected:
+    virtual void SetUp(void)
+    {
+        // Private keys for test vectors. (See RFC 6979, Sect. A.2.3-7.)
+        // NB 1: Entry data must consist contain full bytes. Nibbles will cause
+        // data shifts and unpredictable results.
+        // NB 2: No test vectors for secp256k1 were included in RFC 6979.
+        string prvKeyStr1 = "6FAB034934E4C0FC9AE67F5B5659A9D7D1FEFD187EE09FD4"; // secp192r1
+        string prvKeyStr2 = "F220266E1105BFE3083E03EC7A3A654651F45E37167E88600BF257C1"; // secp224r1
+        string prvKeyStr3 = "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721"; // secp256r1
+        string prvKeyStr4 = "6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5"; // secp384r1
+        string prvKeyStr5 = "00FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538"; // secp521r1
+        unsigned char difPrvKey1[24];
+        unsigned char difPrvKey2[28];
+        unsigned char difPrvKey3[32];
+        unsigned char difPrvKey4[48];
+        unsigned char difPrvKey5[66];
+        hex2bin(prvKeyStr1.c_str(), difPrvKey1);
+        hex2bin(prvKeyStr2.c_str(), difPrvKey2);
+        hex2bin(prvKeyStr3.c_str(), difPrvKey3);
+        hex2bin(prvKeyStr4.c_str(), difPrvKey4);
+        hex2bin(prvKeyStr5.c_str(), difPrvKey5);
+        prvKey1.Decode(reinterpret_cast<const unsigned char*>(difPrvKey1), 24);
+        prvKey2.Decode(reinterpret_cast<const unsigned char*>(difPrvKey2), 28);
+        prvKey3.Decode(reinterpret_cast<const unsigned char*>(difPrvKey3), 32);
+        prvKey4.Decode(reinterpret_cast<const unsigned char*>(difPrvKey4), 48);
+        prvKey5.Decode(reinterpret_cast<const unsigned char*>(difPrvKey5), 66);
+
+        // Unofficial secp256k1 test vectors from Python ECDSA code.
+        string prvKeyStr1U = "9d0219792467d7d37b4d43298a7d0c05";
+        string prvKeyStr2U = "cca9fbcc1b41e5a95d369eaa6ddcff73b61a4efaa279cfc6567e8daa39cbaf50";
+        string prvKeyStr3U = "01";
+        string prvKeyStr4U = "01";
+        string prvKeyStr5U = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140";
+        string prvKeyStr6U = "f8b8af8ce3c7cca5e300d33939540c10d45ce001b8f252bfbc57ba0342904181";
+        unsigned char difPrvKey1U[16];
+        unsigned char difPrvKey2U[32];
+        unsigned char difPrvKey3U[1];
+        unsigned char difPrvKey4U[1];
+        unsigned char difPrvKey5U[32];
+        unsigned char difPrvKey6U[32];
+        hex2bin(prvKeyStr1U.c_str(), difPrvKey1U);
+        hex2bin(prvKeyStr2U.c_str(), difPrvKey2U);
+        hex2bin(prvKeyStr3U.c_str(), difPrvKey3U);
+        hex2bin(prvKeyStr4U.c_str(), difPrvKey4U);
+        hex2bin(prvKeyStr5U.c_str(), difPrvKey5U);
+        hex2bin(prvKeyStr6U.c_str(), difPrvKey6U);
+        prvKey1U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey1U), 16);
+        prvKey2U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey2U), 32);
+        prvKey3U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey3U), 1);
+        prvKey4U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey4U), 1);
+        prvKey5U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey5U), 32);
+        prvKey6U.Decode(reinterpret_cast<const unsigned char*>(difPrvKey6U), 32);
+
+        // Unofficial secp256k1 test vector from Trezor source code (Github)
+        // that isn't duplicated by the Python ECDSA test vector.
+        string prvKeyStr1T = "e91671c46231f833a6406ccbea0e3e392c76c167bac1cb013f6f1013980455c2";
+        unsigned char difPrvKey1T[32];
+        hex2bin(prvKeyStr1T.c_str(), difPrvKey1T);
+        prvKey1T.Decode(reinterpret_cast<const unsigned char*>(difPrvKey1T), 32);
+
+        // Unofficial secp256k1 test vector derived from Python ECDSA source.
+        // Designed to test the case where the k-value is too large and must be
+        // recalculated.
+        string prvKeyStr1F = "009A4D6792295A7F730FC3F2B49CBC0F62E862272F";
+        unsigned char difPrvKey1F[21];
+        hex2bin(prvKeyStr1F.c_str(), difPrvKey1F);
+        prvKey1F.Decode(reinterpret_cast<const unsigned char*>(difPrvKey1F), 21);
+    }
+
+    CryptoPP::Integer prvKey1;
+    CryptoPP::Integer prvKey2;
+    CryptoPP::Integer prvKey3;
+    CryptoPP::Integer prvKey4;
+    CryptoPP::Integer prvKey5;
+    CryptoPP::Integer prvKey1U;
+    CryptoPP::Integer prvKey2U;
+    CryptoPP::Integer prvKey3U;
+    CryptoPP::Integer prvKey4U;
+    CryptoPP::Integer prvKey5U;
+    CryptoPP::Integer prvKey6U;
+    CryptoPP::Integer prvKey1T;
+    CryptoPP::Integer prvKey1F;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(CryptoPPTest, DetSigning)
+{
+    string data1 = "sample";
+    string data2 = "test";
+
+    // secp192r1
+    // Curve orders & results from RFC 6979, Sect. A.2.3-7. (Orders also from
+    // SEC 2 document, Sects. 2.5-2.9.)
+    CryptoPP::Integer secp192r1Order("FFFFFFFFFFFFFFFFFFFFFFFF99DEF836146BC9B1B4D22831h");
+    CryptoPP::Integer secp192r1ExpRes1("32B1B6D7D42A05CB449065727A84804FB1A3E34D8F261496h");
+    CryptoPP::Integer secp192r1ExpRes2("5C4CE89CF56D9E7C77C8585339B006B97B5F0680B4306C6Ch");
+    CryptoPP::Integer secp192r1Res1 = getDetKVal(prvKey1,
+                                                 reinterpret_cast<const unsigned char*>(data1.c_str()),
+                                                 strlen(data1.c_str()),
+                                                 secp192r1Order,
+                                                 secp192r1Order.BitCount());
+    CryptoPP::Integer secp192r1Res2 = getDetKVal(prvKey1,
+                                                 reinterpret_cast<const unsigned char*>(data2.c_str()),
+                                                 strlen(data2.c_str()),
+                                                 secp192r1Order,
+                                                 secp192r1Order.BitCount());
+    EXPECT_EQ(secp192r1ExpRes1, secp192r1Res1);
+    EXPECT_EQ(secp192r1ExpRes2, secp192r1Res2);
+
+    // secp224r1
+    CryptoPP::Integer secp224r1Order("FFFFFFFFFFFFFFFFFFFFFFFFFFFF16A2E0B8F03E13DD29455C5C2A3Dh");
+    CryptoPP::Integer secp224r1ExpRes1("AD3029E0278F80643DE33917CE6908C70A8FF50A411F06E41DEDFCDCh");
+    CryptoPP::Integer secp224r1ExpRes2("FF86F57924DA248D6E44E8154EB69F0AE2AEBAEE9931D0B5A969F904h");
+    CryptoPP::Integer secp224r1Res1 = getDetKVal(prvKey2,
+                                                 reinterpret_cast<const unsigned char*>(data1.c_str()),
+                                                 strlen(data1.c_str()),
+                                                 secp224r1Order,
+                                                 secp224r1Order.BitCount());
+    CryptoPP::Integer secp224r1Res2 = getDetKVal(prvKey2,
+                                                 reinterpret_cast<const unsigned char*>(data2.c_str()),
+                                                 strlen(data2.c_str()),
+                                                 secp224r1Order,
+                                                 secp224r1Order.BitCount());
+    EXPECT_EQ(secp224r1ExpRes1, secp224r1Res1);
+    EXPECT_EQ(secp224r1ExpRes2, secp224r1Res2);
+
+    // secp256r1
+    CryptoPP::Integer secp256r1Order("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551h");
+    CryptoPP::Integer secp256r1ExpRes1("A6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60h");
+    CryptoPP::Integer secp256r1ExpRes2("D16B6AE827F17175E040871A1C7EC3500192C4C92677336EC2537ACAEE0008E0h");
+    CryptoPP::Integer secp256r1Res1 = getDetKVal(prvKey3,
+                                                 reinterpret_cast<const unsigned char*>(data1.c_str()),
+                                                 strlen(data1.c_str()),
+                                                 secp256r1Order,
+                                                 secp256r1Order.BitCount());
+    CryptoPP::Integer secp256r1Res2 = getDetKVal(prvKey3,
+                                                 reinterpret_cast<const unsigned char*>(data2.c_str()),
+                                                 strlen(data2.c_str()),
+                                                 secp256r1Order,
+                                                 secp256r1Order.BitCount());
+    EXPECT_EQ(secp256r1ExpRes1, secp256r1Res1);
+    EXPECT_EQ(secp256r1ExpRes2, secp256r1Res2);
+
+    // secp384r1
+    CryptoPP::Integer secp384r1Order("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973h");
+    CryptoPP::Integer secp384r1ExpRes1("180AE9F9AEC5438A44BC159A1FCB277C7BE54FA20E7CF404B490650A8ACC414E375572342863C899F9F2EDF9747A9B60h");
+    CryptoPP::Integer secp384r1ExpRes2("0CFAC37587532347DC3389FDC98286BBA8C73807285B184C83E62E26C401C0FAA48DD070BA79921A3457ABFF2D630AD7h");
+    CryptoPP::Integer secp384r1Res1 = getDetKVal(prvKey4,
+                                                 reinterpret_cast<const unsigned char*>(data1.c_str()),
+                                                 strlen(data1.c_str()),
+                                                 secp384r1Order,
+                                                 secp384r1Order.BitCount());
+    CryptoPP::Integer secp384r1Res2 = getDetKVal(prvKey4,
+                                                 reinterpret_cast<const unsigned char*>(data2.c_str()),
+                                                 strlen(data2.c_str()),
+                                                 secp384r1Order,
+                                                 secp384r1Order.BitCount());
+    EXPECT_EQ(secp384r1ExpRes1, secp384r1Res1);
+    EXPECT_EQ(secp384r1ExpRes2, secp384r1Res2);
+
+    // secp521r1
+    CryptoPP::Integer secp521r1Order("01FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFA51868783BF2F966B7FCC0148F709A5D03BB5C9B8899C47AEBB6FB71E91386409h");
+    CryptoPP::Integer secp521r1ExpRes1("0EDF38AFCAAECAB4383358B34D67C9F2216C8382AAEA44A3DAD5FDC9C32575761793FEF24EB0FC276DFC4F6E3EC476752F043CF01415387470BCBD8678ED2C7E1A0h");
+    CryptoPP::Integer secp521r1ExpRes2("01DE74955EFAABC4C4F17F8E84D881D1310B5392D7700275F82F145C61E843841AF09035BF7A6210F5A431A6A9E81C9323354A9E69135D44EBD2FCAA7731B909258h");
+    CryptoPP::Integer secp521r1Res1 = getDetKVal(prvKey5,
+                                                 reinterpret_cast<const unsigned char*>(data1.c_str()),
+                                                 strlen(data1.c_str()),
+                                                 secp521r1Order,
+                                                 secp521r1Order.BitCount());
+    CryptoPP::Integer secp521r1Res2 = getDetKVal(prvKey5,
+                                                 reinterpret_cast<const unsigned char*>(data2.c_str()),
+                                                 strlen(data2.c_str()),
+                                                 secp521r1Order,
+                                                 secp521r1Order.BitCount());
+    EXPECT_EQ(secp521r1ExpRes1, secp521r1Res1);
+    EXPECT_EQ(secp521r1ExpRes2, secp521r1Res2);
+
+    // Unofficial secp256k1 test vectors from Python ECDSA code.
+    string data1U = "sample";
+    string data2U = "sample";
+    string data3U = "Satoshi Nakamoto";
+    string data4U = "All those moments will be lost in time, like tears in rain. Time to die...";
+    string data5U = "Satoshi Nakamoto";
+    string data6U = "Alan Turing";
+    CryptoPP::Integer secp256k1ExpRes1U("8fa1f95d514760e498f28957b824ee6ec39ed64826ff4fecc2b5739ec45b91cdh");
+    CryptoPP::Integer secp256k1ExpRes2U("2df40ca70e639d89528a6b670d9d48d9165fdc0febc0974056bdce192b8e16a3h");
+    CryptoPP::Integer secp256k1ExpRes3U("8F8A276C19F4149656B280621E358CCE24F5F52542772691EE69063B74F15D15h");
+    CryptoPP::Integer secp256k1ExpRes4U("38AA22D72376B4DBC472E06C3BA403EE0A394DA63FC58D88686C611ABA98D6B3h");
+    CryptoPP::Integer secp256k1ExpRes5U("33A19B60E25FB6F4435AF53A3D42D493644827367E6453928554F43E49AA6F90h");
+    CryptoPP::Integer secp256k1ExpRes6U("525A82B70E67874398067543FD84C83D30C175FDC45FDEEE082FE13B1D7CFDF1h");
+    CryptoPP::Integer secp256k1Order("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141h");
+    CryptoPP::Integer secp256k1Res1U = getDetKVal(prvKey1U,
+                                                  reinterpret_cast<const unsigned char*>(data1U.c_str()),
+                                                  strlen(data1U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    CryptoPP::Integer secp256k1Res2U = getDetKVal(prvKey2U,
+                                                  reinterpret_cast<const unsigned char*>(data2U.c_str()),
+                                                  strlen(data2U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    CryptoPP::Integer secp256k1Res3U = getDetKVal(prvKey3U,
+                                                  reinterpret_cast<const unsigned char*>(data3U.c_str()),
+                                                  strlen(data3U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    CryptoPP::Integer secp256k1Res4U = getDetKVal(prvKey4U,
+                                                  reinterpret_cast<const unsigned char*>(data4U.c_str()),
+                                                  strlen(data4U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    CryptoPP::Integer secp256k1Res5U = getDetKVal(prvKey5U,
+                                                  reinterpret_cast<const unsigned char*>(data5U.c_str()),
+                                                  strlen(data5U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    CryptoPP::Integer secp256k1Res6U = getDetKVal(prvKey6U,
+                                                  reinterpret_cast<const unsigned char*>(data6U.c_str()),
+                                                  strlen(data6U.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    EXPECT_EQ(secp256k1ExpRes1U, secp256k1Res1U);
+    EXPECT_EQ(secp256k1ExpRes2U, secp256k1Res2U);
+    EXPECT_EQ(secp256k1ExpRes3U, secp256k1Res3U);
+    EXPECT_EQ(secp256k1ExpRes4U, secp256k1Res4U);
+    EXPECT_EQ(secp256k1ExpRes5U, secp256k1Res5U);
+    EXPECT_EQ(secp256k1ExpRes6U, secp256k1Res6U);
+
+//////
+    // Repeat a Python ECDSA test vector using Armory's signing/verification
+    // methodology (via Crypto++).
+    // NB: Once RFC 6979 is properly integrated into Armory, this code ought to
+    // use the actual signing & verification calls.
+    SecureBinaryData prvKeyX(32);
+    prvKey5U.Encode(prvKeyX.getPtr(), prvKeyX.getSize());
+    BTC_PRIVKEY prvKeyY = CryptoECDSA().ParsePrivateKey(prvKeyX);
+
+    // Signing materials
+    BTC_DETSIGNER signer(prvKeyY);
+    string outputSig;
+
+    // PRNG
+    BTC_PRNG dummyPRNG;
+
+    // Data
+    SecureBinaryData dataToSign(data5U.c_str());
+    CryptoPP::StringSource(dataToSign.toBinStr(), true,
+                           new CryptoPP::SignerFilter(dummyPRNG, signer,
+                                                      new CryptoPP::StringSink(outputSig)));
+
+    // Verify the sig.
+    BTC_PUBKEY pubKeyY = CryptoECDSA().ComputePublicKey(prvKeyY);
+    BTC_VERIFIER verifier(pubKeyY);
+    SecureBinaryData finalSig(outputSig);
+    EXPECT_TRUE(verifier.VerifyMessage((const byte*)dataToSign.getPtr(), 
+                                                    dataToSign.getSize(),
+                                       (const byte*)finalSig.getPtr(), 
+                                                    finalSig.getSize()));
+//////
+
+    // Unofficial secp256k1 test vector derived from Python ECDSA source.
+    // Designed to test the case where the k-value is too large and must be
+    // recalculated.
+    string data1F = "I want to be larger than the curve's order!!!1!";
+    CryptoPP::Integer failExpRes1F("011e31b61d6822c294268786a22abb2de5f415d94fh");
+    CryptoPP::Integer failOrder("04000000000000000000020108A2E0CC0D99F8A5EFh");
+    CryptoPP::Integer failRes1F = getDetKVal(prvKey1F,
+                                             reinterpret_cast<const unsigned char*>(data1F.c_str()),
+                                             strlen(data1F.c_str()),
+                                             failOrder,
+                                             168); // Force code to use all bits 
+    EXPECT_EQ(failExpRes1F, failRes1F);
+
+    // Unofficial secp256k1 test vector from Trezor source code (Github) that
+    // isn't duplicated by the Python ECDSA test vector.
+    string data1T = "There is a computer disease that anybody who works with computers knows about. It's a very serious disease and it interferes completely with the work. The trouble with computers is that you 'play' with them!";
+    CryptoPP::Integer secp256k1ExpRes1T("1f4b84c23a86a221d233f2521be018d9318639d5b8bbd6374a8a59232d16ad3dh");
+    CryptoPP::Integer secp256k1Res1T = getDetKVal(prvKey1T,
+                                                  reinterpret_cast<const unsigned char*>(data1T.c_str()),
+                                                  strlen(data1T.c_str()),
+                                                  secp256k1Order,
+                                                  secp256k1Order.BitCount());
+    EXPECT_EQ(secp256k1ExpRes1T, secp256k1Res1T);
+
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -251,6 +474,10 @@ protected:
 TEST_F(BinaryDataTest, Constructor)
 {
    uint8_t* ptr = new uint8_t[4];
+   ptr[0]='0'; // random junk
+   ptr[1]='1';
+   ptr[2]='2';
+   ptr[3]='3';
 
    BinaryData a;
    BinaryData b(4);
@@ -1736,7 +1963,7 @@ TEST_F(BtcUtilsTest, TxOutScriptID_NonStd)
    // This was from block 150951 which was erroneously produced by MagicalTux
    // This is not only non-standard, it's non-spendable
    BinaryData script = READHEX("76a90088ac");
-   BinaryData a160   = BtcUtils::BadAddress_;
+   BinaryData a160   = BtcUtils::BadAddress();
    BinaryData unique = READHEX("ff") + BtcUtils::getHash160(READHEX("76a90088ac"));
    TXOUT_SCRIPT_TYPE scrType = BtcUtils::getTxOutScriptType(script);
    EXPECT_EQ(scrType, TXOUT_SCRIPT_NONSTANDARD );
@@ -1771,11 +1998,13 @@ TEST_F(BtcUtilsTest, TxOutScriptID_Multisig)
       "5221034758cefcb75e16e4dfafb32383b709fa632086ea5ca982712de6add93"
       "060b17a2103fe96237629128a0ae8c3825af8a4be8fe3109b16f62af19cec0b1"
       "eb93b8717e252ae");
-   BinaryData pub1   = READHEX("034758cefcb75e16e4dfafb32383b709fa632086ea5ca982712de6add93060b17a");
-   BinaryData pub2   = READHEX("03fe96237629128a0ae8c3825af8a4be8fe3109b16f62af19cec0b1eb93b8717e2");
-   BinaryData addr1  = READHEX("785652a6b8e721e80ffa353e5dfd84f0658284a9");
-   BinaryData addr2  = READHEX("b3348abf9dd2d1491359f937e2af64b1bb6d525a");
-   BinaryData a160   = BtcUtils::BadAddress_;
+   BinaryData pub1   = READHEX(
+      "034758cefcb75e16e4dfafb32383b709fa632086ea5ca982712de6add93060b17a");
+   BinaryData pub2   = READHEX(
+      "03fe96237629128a0ae8c3825af8a4be8fe3109b16f62af19cec0b1eb93b8717e2");
+   BinaryData addr1  = READHEX("b3348abf9dd2d1491359f937e2af64b1bb6d525a");
+   BinaryData addr2  = READHEX("785652a6b8e721e80ffa353e5dfd84f0658284a9");
+   BinaryData a160   = BtcUtils::BadAddress();
    BinaryData unique = READHEX(
       "fe0202785652a6b8e721e80ffa353e5dfd84f0658284a9b3348abf9dd2d14913"
       "59f937e2af64b1bb6d525a");
@@ -1798,10 +2027,15 @@ TEST_F(BtcUtilsTest, TxOutScriptID_MultiList)
       "b93b8717e252ae");
    BinaryData addr0  = READHEX("785652a6b8e721e80ffa353e5dfd84f0658284a9");
    BinaryData addr1  = READHEX("b3348abf9dd2d1491359f937e2af64b1bb6d525a");
-   BinaryData a160   = BtcUtils::BadAddress_;
+   BinaryData a160   = BtcUtils::BadAddress();
    BinaryData unique = READHEX(
       "fe0202785652a6b8e721e80ffa353e5dfd84f0658284a9b3348abf9dd2d14913"
       "59f937e2af64b1bb6d525a");
+
+   BinaryData pub0 = READHEX(
+      "034758cefcb75e16e4dfafb32383b709fa632086ea5ca982712de6add93060b17a");
+   BinaryData pub1 = READHEX(
+      "03fe96237629128a0ae8c3825af8a4be8fe3109b16f62af19cec0b1eb93b8717e2");
 
    vector<BinaryData> a160List;
    uint32_t M;
@@ -1812,6 +2046,14 @@ TEST_F(BtcUtilsTest, TxOutScriptID_MultiList)
    
    EXPECT_EQ(a160List[0], addr0);
    EXPECT_EQ(a160List[1], addr1);
+
+   vector<BinaryData> pkList;
+   M = BtcUtils::getMultisigPubKeyList(script, pkList);
+   EXPECT_EQ(M, 2);              
+   EXPECT_EQ(pkList.size(), 2); // N
+   
+   EXPECT_EQ(pkList[0], pub0);
+   EXPECT_EQ(pkList[1], pub1);
 }
 
 
@@ -1869,7 +2111,7 @@ TEST_F(BtcUtilsTest, TxInScriptID_Coinbase)
 {
    BinaryData script = READHEX(
       "0310920304000071c3124d696e656420627920425443204775696c640800b75f950e000000");
-   BinaryData a160 =  BtcUtils::BadAddress_;
+   BinaryData a160 =  BtcUtils::BadAddress();
    BinaryData prevHash = prevHashCB_;
 
    TXIN_SCRIPT_TYPE scrType = BtcUtils::getTxInScriptType(script, prevHash);
@@ -1886,7 +2128,7 @@ TEST_F(BtcUtilsTest, TxInScriptID_SpendPubKey)
       "47304402201ffc44394e5a3dd9c8b55bdc12147e18574ac945d15dac026793bf"
       "3b8ff732af022035fd832549b5176126f735d87089c8c1c1319447a458a09818"
       "e173eaf0c2eef101");
-   BinaryData a160 =  BtcUtils::BadAddress_;
+   BinaryData a160 =  BtcUtils::BadAddress();
    BinaryData prevHash = prevHashReg_;
 
    TXIN_SCRIPT_TYPE scrType = BtcUtils::getTxInScriptType(script, prevHash);
@@ -1909,7 +2151,7 @@ TEST_F(BtcUtilsTest, TxInScriptID_SpendMultisig)
       "520db45494ec095ce80148304502206ee62f539d5cd94f990b7abfda77750f58"
       "ff91043c3f002501e5448ef6dba2520221009d29229cdfedda1dd02a1a90bb71"
       "b30b77e9c3fc28d1353f054c86371f6c2a8101");
-   BinaryData a160 =  BtcUtils::BadAddress_;
+   BinaryData a160 =  BtcUtils::BadAddress();
    BinaryData prevHash = prevHashReg_;
    TXIN_SCRIPT_TYPE scrType = BtcUtils::getTxInScriptType(script, prevHash);
    EXPECT_EQ(scrType, TXIN_SCRIPT_SPENDMULTI);
@@ -2187,7 +2429,8 @@ TEST_F(BlockObjTest, HeaderNoInit)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockObjTest, HeaderUnserialize)
 {
-   EXPECT_TRUE(bh_.isInitialized());
+   bool boolFalse = false;
+   EXPECT_NE(bh_.isInitialized(), boolFalse);
    EXPECT_EQ(bh_.getNumTx(), UINT32_MAX);
    EXPECT_EQ(bh_.getBlockSize(), UINT32_MAX);
    EXPECT_EQ(bh_.getVersion(), 1);
@@ -2264,7 +2507,7 @@ TEST_F(BlockObjTest, OutPointSerialize)
    BinaryData prevIdx = READHEX(
       "01000000");
 
-   OutPoint op(rawOP.getPtr());
+   OutPoint op(rawOP.getPtr(), rawOP.getSize());
    EXPECT_EQ(op.getTxHash().getSize(), 32);
    EXPECT_EQ(op.getTxOutIndex(), 1);
    EXPECT_EQ(op.getTxHash(), prevHash);
@@ -2290,7 +2533,7 @@ TEST_F(BlockObjTest, TxInNoInit)
    txin.setParentHash(newhash);
    txin.setParentHeight(1234);
    
-   EXPECT_EQ(txin.getParentHash(),   newhash);
+   EXPECT_EQ(txin.getParentHash(nullptr),   newhash);
    EXPECT_EQ(txin.getParentHeight(), 1234);
 }
 
@@ -2299,7 +2542,7 @@ TEST_F(BlockObjTest, TxInNoInit)
 TEST_F(BlockObjTest, TxInUnserialize)
 {
    BinaryRefReader brr(rawTxIn_);
-   uint32_t len = rawTxIn_.getSize();
+   const uint32_t len = rawTxIn_.getSize();
    BinaryData srcAddr = BtcUtils::getHash160( READHEX("04"
       "5d74feae58c4c36d7c35beac05eddddc78b3ce4b02491a2eea72043978056a8b"
       "c439b99ddaad327207b09ef16a8910828e805b0cc8c11fba5caea2ee939346d7"));
@@ -2307,16 +2550,15 @@ TEST_F(BlockObjTest, TxInUnserialize)
       "0044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0ebf6a69324"
       "01000000");
 
-   vector<TxIn> txins(7);
-   txins[0] = TxIn(rawTxIn_.getPtr()); 
-   txins[1] = TxIn(rawTxIn_.getPtr(), len); 
-   txins[2] = TxIn(rawTxIn_.getPtr(), len, TxRef(), 12); 
-   txins[3].unserialize(rawTxIn_.getPtr());
-   txins[4].unserialize(rawTxIn_.getRef());
-   txins[5].unserialize(brr);
-   txins[6].unserialize_swigsafe_(rawTxIn_);
+   vector<TxIn> txins(6);
+   txins[0].unserialize_checked(rawTxIn_.getPtr(), len); 
+   txins[1].unserialize_checked(rawTxIn_.getPtr(), len, len); 
+   txins[2].unserialize_checked(rawTxIn_.getPtr(), len, len, TxRef(), 12); 
+   txins[3].unserialize(rawTxIn_.getRef());
+   txins[4].unserialize(brr);
+   txins[5].unserialize_swigsafe_(rawTxIn_);
 
-   for(uint32_t i=0; i<7; i++)
+   for(uint32_t i=0; i<6; i++)
    {
       EXPECT_TRUE( txins[i].isInitialized());
       EXPECT_EQ(   txins[i].serialize().getSize(), len);
@@ -2330,7 +2572,7 @@ TEST_F(BlockObjTest, TxInUnserialize)
 
       EXPECT_FALSE(txins[i].getParentTxRef().isInitialized());
       EXPECT_EQ(   txins[i].getParentHeight(), UINT32_MAX);
-      EXPECT_EQ(   txins[i].getParentHash(),   BinaryData(0));
+      EXPECT_EQ(   txins[i].getParentHash(nullptr),   BinaryData(0));
       EXPECT_EQ(   txins[i].serialize(),       rawTxIn_);
       if(i==2)
          EXPECT_EQ(txins[i].getIndex(), 12);
@@ -2347,16 +2589,15 @@ TEST_F(BlockObjTest, TxOutUnserialize)
    uint32_t len = rawTxOut_.getSize();
    BinaryData dstAddr = READHEX("8dce8946f1c7763bb60ea5cf16ef514cbed0633b");
 
-   vector<TxOut> txouts(7);
-   txouts[0] = TxOut(rawTxOut_.getPtr()); 
-   txouts[1] = TxOut(rawTxOut_.getPtr(), len); 
-   txouts[2] = TxOut(rawTxOut_.getPtr(), len, TxRef(), 12); 
-   txouts[3].unserialize(rawTxOut_.getPtr());
-   txouts[4].unserialize(rawTxOut_.getRef());
-   txouts[5].unserialize(brr);
-   txouts[6].unserialize_swigsafe_(rawTxOut_);
+   vector<TxOut> txouts(6);
+   txouts[0].unserialize_checked(rawTxOut_.getPtr(), len); 
+   txouts[1].unserialize_checked(rawTxOut_.getPtr(), len, len); 
+   txouts[2].unserialize_checked(rawTxOut_.getPtr(), len, len, TxRef(), 12); 
+   txouts[3].unserialize(rawTxOut_.getRef());
+   txouts[4].unserialize(brr);
+   txouts[5].unserialize_swigsafe_(rawTxOut_);
 
-   for(uint32_t i=0; i<7; i++)
+   for(uint32_t i=0; i<6; i++)
    {
       EXPECT_TRUE( txouts[i].isInitialized());
       EXPECT_EQ(   txouts[i].getSize(), len);
@@ -2375,7 +2616,7 @@ TEST_F(BlockObjTest, TxOutUnserialize)
 
       EXPECT_FALSE(txouts[i].getParentTxRef().isInitialized());
       EXPECT_EQ(   txouts[i].getParentHeight(), UINT32_MAX);
-      EXPECT_EQ(   txouts[i].getParentHash(),   BinaryData(0));
+      EXPECT_EQ(   txouts[i].getParentHash(nullptr),   BinaryData(0));
       EXPECT_EQ(   txouts[i].serialize(),       rawTxOut_);
       if(i==2)
          EXPECT_EQ(txouts[i].getIndex(), 12);
@@ -2428,11 +2669,11 @@ TEST_F(BlockObjTest, TxUnserialize)
 
    Tx tx;
    vector<Tx> txs(10);
-   txs[0] = Tx(rawTx0_.getPtr()); 
+   txs[0] = Tx(rawTx0_.getPtr(), len); 
    txs[1] = Tx(brr);  brr.resetPosition();
    txs[2] = Tx(rawTx0_);
    txs[3] = Tx(rawTx0_.getRef());
-   txs[4].unserialize(rawTx0_.getPtr());
+   txs[4].unserialize(rawTx0_.getPtr(), len);
    txs[5].unserialize(rawTx0_);
    txs[6].unserialize(rawTx0_.getRef());
    txs[7].unserialize(brr);  brr.resetPosition();
@@ -2659,11 +2900,7 @@ protected:
       tx2_.unserialize(rawTx1_);
 
 
-      sbh_.unserialize(rawHead_);
-
-      // Make sure the global DB type and prune type are reset for each test
-      DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
+      sbh_.setHeaderData(rawHead_);
    }
 
    BinaryData PREFBYTE(DB_PREFIX pref) 
@@ -2690,8 +2927,6 @@ protected:
    BinaryData rawTxFragged_;
    BinaryData rawTxOut0_;
    BinaryData rawTxOut1_;
-
-
 
    StoredHeader sbh_;
 };
@@ -2787,7 +3022,7 @@ TEST_F(StoredBlockObjTest, GetDBKeys)
 TEST_F(StoredBlockObjTest, LengthUnfrag)
 {
    StoredTx tx;
-   vector<uint32_t> offin, offout;
+   vector<size_t> offin, offout;
 
    uint32_t lenUnfrag  = BtcUtils::StoredTxCalcLength( rawTxUnfrag_.getPtr(), 
                                                        false, 
@@ -2811,7 +3046,7 @@ TEST_F(StoredBlockObjTest, LengthUnfrag)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, LengthFragged)
 {
-   vector<uint32_t> offin, offout;
+   vector<size_t> offin, offout;
 
    uint32_t lenFragged = BtcUtils::StoredTxCalcLength( rawTxFragged_.getPtr(), 
                                                        true, 
@@ -2833,23 +3068,23 @@ TEST_F(StoredBlockObjTest, LengthFragged)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, BlkDataKeys)
 {
-   uint32_t hgt = 0x001a332b;
-   uint8_t  dup = 0x01;
-   uint16_t tix = 0x0102;
-   uint16_t tox = 0x0021;
+   const uint32_t hgt = 0x001a332b;
+   const uint8_t  dup = 0x01;
+   const uint16_t tix = 0x0102;
+   const uint16_t tox = 0x0021;
    
-   EXPECT_EQ(DBUtils.getBlkDataKey(hgt, dup),           
+   EXPECT_EQ(DBUtils::getBlkDataKey(hgt, dup),           
                                                READHEX("031a332b01"));
-   EXPECT_EQ(DBUtils.getBlkDataKey(hgt, dup, tix),      
+   EXPECT_EQ(DBUtils::getBlkDataKey(hgt, dup, tix),      
                                                READHEX("031a332b010102"));
-   EXPECT_EQ(DBUtils.getBlkDataKey(hgt, dup, tix, tox), 
+   EXPECT_EQ(DBUtils::getBlkDataKey(hgt, dup, tix, tox), 
                                                READHEX("031a332b0101020021"));
 
-   EXPECT_EQ(DBUtils.getBlkDataKeyNoPrefix(hgt, dup),           
+   EXPECT_EQ(DBUtils::getBlkDataKeyNoPrefix(hgt, dup),           
                                                READHEX("1a332b01"));
-   EXPECT_EQ(DBUtils.getBlkDataKeyNoPrefix(hgt, dup, tix),      
+   EXPECT_EQ(DBUtils::getBlkDataKeyNoPrefix(hgt, dup, tix),      
                                                READHEX("1a332b010102"));
-   EXPECT_EQ(DBUtils.getBlkDataKeyNoPrefix(hgt, dup, tix, tox), 
+   EXPECT_EQ(DBUtils::getBlkDataKeyNoPrefix(hgt, dup, tix, tox), 
                                                READHEX("1a332b0101020021"));
 }
 
@@ -2875,14 +3110,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 5 bytes, with prefix
    brr.setNewData(key5p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_HEADER);
 
    brr.setNewData(key5p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi, UINT16_MAX);
@@ -2890,7 +3125,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_HEADER);
    
    brr.setNewData(key5p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi, UINT16_MAX);
@@ -2902,14 +3137,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 7 bytes, with prefix
    brr.setNewData(key7p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_TX);
 
    brr.setNewData(key7p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -2917,7 +3152,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_TX);
    
    brr.setNewData(key7p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -2929,14 +3164,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 9 bytes, with prefix
    brr.setNewData(key9p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_TXOUT);
 
    brr.setNewData(key9p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -2944,7 +3179,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_TXOUT);
    
    brr.setNewData(key9p);
-   bdtype = DBUtils.readBlkDataKey(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKey(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -2956,14 +3191,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 5 bytes, no prefix
    brr.setNewData(key5);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_HEADER);
 
    brr.setNewData(key5);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi, UINT16_MAX);
@@ -2971,7 +3206,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_HEADER);
    
    brr.setNewData(key5);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi, UINT16_MAX);
@@ -2983,14 +3218,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 7 bytes, no prefix
    brr.setNewData(key7);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_TX);
 
    brr.setNewData(key7);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -2998,7 +3233,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_TX);
    
    brr.setNewData(key7);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -3010,14 +3245,14 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    /////////////////////////////////////////////////////////////////////////////
    // 9 bytes, no prefix
    brr.setNewData(key9);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( brr.getSizeRemaining(), 0);
    EXPECT_EQ( bdtype, BLKDATA_TXOUT);
 
    brr.setNewData(key9);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -3025,7 +3260,7 @@ TEST_F(StoredBlockObjTest, ReadBlkKeyData)
    EXPECT_EQ( bdtype, BLKDATA_TXOUT);
    
    brr.setNewData(key9);
-   bdtype = DBUtils.readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
+   bdtype = DBUtils::readBlkDataKeyNoPrefix(brr, hgt, dup, txi, txo);
    EXPECT_EQ( hgt,     123000);
    EXPECT_EQ( dup,         15);
    EXPECT_EQ( txi,          7);
@@ -3054,8 +3289,8 @@ TEST_F(StoredBlockObjTest, SHeaderUnserialize)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, SHeaderDBSerFull_H)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    sbh_.blockHeight_      = 65535;
    sbh_.duplicateID_      = 1;
@@ -3063,11 +3298,11 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_H)
    sbh_.merkleIsPartial_  = false;
    sbh_.isMainBranch_     = true;
    sbh_.numTx_            = 15;
-   sbh_.numBytes_         = 65535;
+   sbh_.numBytes_         = 0xdeadbeef;
 
    // SetUp already contains sbh_.unserialize(rawHead_);
-   BinaryData last4 = READHEX("00ffff01");
-   EXPECT_EQ(sbh_.serializeDBValue(HEADERS), rawHead_ + last4);
+   BinaryData last4 = READHEX("00ffff01efbeadde");
+   EXPECT_EQ(serializeDBValue(sbh_, HEADERS, ARMORY_DB_FULL, DB_PRUNE_NONE), rawHead_ + last4);
 }
 
 
@@ -3076,8 +3311,8 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B1)
 {
    // ARMORY_DB_FULL means no merkle string (cause all Tx are in the DB
    // so the merkle tree would be redundant.
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    sbh_.blockHeight_      = 65535;
    sbh_.duplicateID_      = 1;
@@ -3093,7 +3328,7 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B1)
    BinaryData nbyte = READHEX("ffff0000");
 
    BinaryData headBlkData = flags + rawHead_ + ntx + nbyte;
-   EXPECT_EQ(sbh_.serializeDBValue(BLKDATA), headBlkData);
+   EXPECT_EQ(serializeDBValue(sbh_, BLKDATA, ARMORY_DB_FULL, DB_PRUNE_NONE), headBlkData);
 }
 
 
@@ -3101,8 +3336,8 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B1)
 TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B2)
 {
    // With merkle string
-   DBUtils.setArmoryDbType(ARMORY_DB_PARTIAL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_PARTIAL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    BinaryWriter bw;
 
@@ -3120,14 +3355,14 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B2)
    BinaryData nbyte = READHEX("ffff0000");
 
    BinaryData headBlkData = flags + rawHead_ + ntx + nbyte + sbh_.merkle_;
-   EXPECT_EQ(sbh_.serializeDBValue(BLKDATA), headBlkData);
+   EXPECT_EQ(serializeDBValue(sbh_, BLKDATA, ARMORY_DB_PARTIAL, DB_PRUNE_NONE), headBlkData);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B3)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_LITE);
-   DBUtils.setDbPruneType(DB_PRUNE_ALL);
+//    DBUtils::setArmoryDbType(ARMORY_DB_LITE);
+//    DBUtils::setDbPruneType(DB_PRUNE_ALL);
 
    BinaryWriter bw;
 
@@ -3145,7 +3380,7 @@ TEST_F(StoredBlockObjTest, SHeaderDBSerFull_B3)
    BinaryData nbyte = READHEX("ffff0000");
 
    BinaryData headBlkData = flags + rawHead_ + ntx + nbyte;
-   EXPECT_EQ(sbh_.serializeDBValue(BLKDATA), headBlkData);
+   EXPECT_EQ(serializeDBValue(sbh_, BLKDATA, ARMORY_DB_LITE, DB_PRUNE_ALL), headBlkData);
 }
 
 
@@ -3155,12 +3390,13 @@ TEST_F(StoredBlockObjTest, SHeaderDBUnserFull_H)
    BinaryData dbval = READHEX(
       "010000001d8f4ec0443e1f19f305e488c1085c95de7cc3fd25e0d2c5bb5d0000"
       "000000009762547903d36881a86751f3f5049e23050113f779735ef82734ebf0"
-      "b4450081d8c8c84db3936a1a334b035b00ffff01");
+      "b4450081d8c8c84db3936a1a334b035b00ffff01ee110000");
 
    BinaryRefReader brr(dbval);
    sbh_.unserializeDBValue(HEADERS, brr);
 
    EXPECT_EQ(sbh_.blockHeight_, 65535);
+   EXPECT_EQ(sbh_.numBytes_, 0x11ee);
    EXPECT_EQ(sbh_.duplicateID_, 1);
 }
 
@@ -3334,8 +3570,8 @@ TEST_F(StoredBlockObjTest, STxSerUnfragToFrag)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxSerDBValue_1)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
    
    Tx origTx(rawTxUnfrag_);
 
@@ -3352,7 +3588,7 @@ TEST_F(StoredBlockObjTest, STxSerDBValue_1)
    BinaryData  txHash  = origTx.getThisHash();
    BinaryData  fragged = stx.getSerializedTxFragged();
    BinaryData  output  = first2 + txHash + fragged;
-   EXPECT_EQ(stx.serializeDBValue(), output);
+   EXPECT_EQ(serializeDBValue(stx, ARMORY_DB_FULL, DB_PRUNE_NONE), output);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3360,8 +3596,8 @@ TEST_F(StoredBlockObjTest, DISABLED_STxSerDBValue_2)
 {
    // I modified the ARMORY_DB_SUPER code to frag, as well.  There's no
    // mode that doesn't frag, now.
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+   //DBUtils::setArmoryDbType(ARMORY_DB_SUPER);
+   //DBUtils::setDbPruneType(DB_PRUNE_NONE);
    
    Tx origTx(rawTxUnfrag_);
 
@@ -3378,7 +3614,7 @@ TEST_F(StoredBlockObjTest, DISABLED_STxSerDBValue_2)
    BinaryData  txHash  = origTx.getThisHash();
    BinaryData  fragged = stx.getSerializedTx();  // Full Tx this time
    BinaryData  output  = first2 + txHash + fragged;
-   EXPECT_EQ(stx.serializeDBValue(), output);
+   EXPECT_EQ(serializeDBValue(stx, ARMORY_DB_SUPER, DB_PRUNE_NONE), output);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3492,8 +3728,8 @@ TEST_F(StoredBlockObjTest, STxOutUnserialize)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxOutSerDBValue_1)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredTxOut stxo0;
 
@@ -3508,15 +3744,15 @@ TEST_F(StoredBlockObjTest, STxOutSerDBValue_1)
    //
    // For this example:  DBVer=0, TxVer=1, TxSer=FRAGGED[1]
    //   0000   01    00   0  --- ----
-   EXPECT_EQ(stxo0.serializeDBValue(),  READHEX("0400") + rawTxOut0_);
+   EXPECT_EQ(serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE),  READHEX("0400") + rawTxOut0_);
 }
    
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxOutSerDBValue_2)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredTxOut stxo0;
    stxo0.unserialize(rawTxOut0_);
@@ -3525,10 +3761,13 @@ TEST_F(StoredBlockObjTest, STxOutSerDBValue_2)
 
    // Test a spent TxOut
    //   0000   01    01   0  --- ----
-   BinaryData spentStr = DBUtils.getBlkDataKeyNoPrefix( 100000, 1, 127, 15);
+   BinaryData spentStr = DBUtils::getBlkDataKeyNoPrefix( 100000, 1, 127, 15);
    stxo0.spentness_ = TXOUT_SPENT;
    stxo0.spentByTxInKey_ = spentStr;
-   EXPECT_EQ(stxo0.serializeDBValue(), READHEX("0500")+rawTxOut0_+spentStr);
+   EXPECT_EQ(
+      serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      READHEX("0500")+rawTxOut0_+spentStr
+   );
 }
 
 
@@ -3536,8 +3775,8 @@ TEST_F(StoredBlockObjTest, STxOutSerDBValue_2)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxOutSerDBValue_3)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredTxOut stxo0;
    stxo0.unserialize(rawTxOut0_);
@@ -3546,12 +3785,13 @@ TEST_F(StoredBlockObjTest, STxOutSerDBValue_3)
 
    // Test a spent TxOut but in lite mode where we don't record spentness
    //   0000   01    01   1  --- ----
-   DBUtils.setArmoryDbType(ARMORY_DB_LITE);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-   BinaryData spentStr = DBUtils.getBlkDataKeyNoPrefix( 100000, 1, 127, 15);
+   BinaryData spentStr = DBUtils::getBlkDataKeyNoPrefix( 100000, 1, 127, 15);
    stxo0.spentness_ = TXOUT_SPENT;
    stxo0.spentByTxInKey_ = spentStr;
-   EXPECT_EQ(stxo0.serializeDBValue(), READHEX("0680")+rawTxOut0_);
+   EXPECT_EQ(
+      serializeDBValue(stxo0, ARMORY_DB_LITE, DB_PRUNE_NONE),
+      READHEX("0680")+rawTxOut0_
+   );
 }
 
 
@@ -3636,8 +3876,8 @@ TEST_F(StoredBlockObjTest, SHeaderFullBlock)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, SUndoDataSer)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    BinaryData arbHash  = READHEX("11112221111222111122222211112222"
                                  "11112221111222111122211112221111");
@@ -3691,7 +3931,7 @@ TEST_F(StoredBlockObjTest, SUndoDataSer)
                op0.serialize() +
                op1.serialize();
 
-   EXPECT_EQ(sud.serializeDBValue(), answer);
+   EXPECT_EQ(serializeDBValue(sud, ARMORY_DB_FULL, DB_PRUNE_NONE), answer);
 }
 
 
@@ -3699,8 +3939,8 @@ TEST_F(StoredBlockObjTest, SUndoDataSer)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, SUndoDataUnser)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    BinaryData arbHash  = READHEX("11112221111222111122222211112222"
                                  "11112221111222111122211112221111");
@@ -3733,7 +3973,7 @@ TEST_F(StoredBlockObjTest, SUndoDataUnser)
       "bbbbffffbbbbffffbbbb02000000");
 
    StoredUndoData sud;
-   sud.unserializeDBValue(sudToUnser);
+   sud.unserializeDBValue(sudToUnser, ARMORY_DB_FULL, DB_PRUNE_NONE);
 
    ASSERT_EQ(sud.outPointsAddedByBlock_.size(), 2);
    ASSERT_EQ(sud.stxOutsRemovedByBlock_.size(), 2);
@@ -3758,9 +3998,9 @@ TEST_F(StoredBlockObjTest, SUndoDataUnser)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxHintsSer)
 {
-   BinaryData hint0 = DBUtils.getBlkDataKeyNoPrefix(123000,  7, 255);
-   BinaryData hint1 = DBUtils.getBlkDataKeyNoPrefix(123000, 15, 127);
-   BinaryData hint2 = DBUtils.getBlkDataKeyNoPrefix(183922, 15,   3);
+   BinaryData hint0 = DBUtils::getBlkDataKeyNoPrefix(123000,  7, 255);
+   BinaryData hint1 = DBUtils::getBlkDataKeyNoPrefix(123000, 15, 127);
+   BinaryData hint2 = DBUtils::getBlkDataKeyNoPrefix(183922, 15,   3);
 
    StoredTxHints sths;
    sths.txHashPrefix_ = READHEX("aaaaffff");
@@ -3797,9 +4037,9 @@ TEST_F(StoredBlockObjTest, STxHintsSer)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxHintsReorder)
 {
-   BinaryData hint0 = DBUtils.getBlkDataKeyNoPrefix(123000,  7, 255);
-   BinaryData hint1 = DBUtils.getBlkDataKeyNoPrefix(123000, 15, 127);
-   BinaryData hint2 = DBUtils.getBlkDataKeyNoPrefix(183922, 15,   3);
+   BinaryData hint0 = DBUtils::getBlkDataKeyNoPrefix(123000,  7, 255);
+   BinaryData hint1 = DBUtils::getBlkDataKeyNoPrefix(123000, 15, 127);
+   BinaryData hint2 = DBUtils::getBlkDataKeyNoPrefix(183922, 15,   3);
 
    StoredTxHints sths;
    sths.txHashPrefix_ = READHEX("aaaaffff");
@@ -3821,9 +4061,9 @@ TEST_F(StoredBlockObjTest, STxHintsReorder)
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(StoredBlockObjTest, STxHintsUnser)
 {
-   BinaryData hint0 = DBUtils.getBlkDataKeyNoPrefix(123000,  7, 255);
-   BinaryData hint1 = DBUtils.getBlkDataKeyNoPrefix(123000, 15, 127);
-   BinaryData hint2 = DBUtils.getBlkDataKeyNoPrefix(183922, 15,   3);
+   BinaryData hint0 = DBUtils::getBlkDataKeyNoPrefix(123000,  7, 255);
+   BinaryData hint1 = DBUtils::getBlkDataKeyNoPrefix(123000, 15, 127);
+   BinaryData hint2 = DBUtils::getBlkDataKeyNoPrefix(183922, 15,   3);
 
    BinaryData in0 = READHEX("00");
    BinaryData in1 = READHEX("01""01e0780700ff");
@@ -4016,10 +4256,10 @@ TEST_F(StoredBlockObjTest, SScriptHistorySer)
    ssh.alreadyScannedUpToBlk_ = 65535;
 
    /////////////////////////////////////////////////////////////////////////////
-   // Empty SSH (probably shouldn't even be serialized/written, in the future)
+   // Empty SSH (shouldn't be written in supernode, should be in full node)
    BinaryData expect, expSub1, expSub2;
-   expect = READHEX("0400""ffff0000""00");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
+   expect = READHEX("0400""ffff0000""00""0000000000000000");
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
 
    /////////////////////////////////////////////////////////////////////////////
    // With a single TxIO
@@ -4029,47 +4269,47 @@ TEST_F(StoredBlockObjTest, SScriptHistorySer)
    txio0.setMultisig(false);
    ssh.insertTxio(txio0);
 
-   expect = READHEX("0400""ffff0000""01""00""0100000000000000""0000ff00""0001""0001");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
+   expect = READHEX("0400""ffff0000""01""0100000000000000");
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
 
    /////////////////////////////////////////////////////////////////////////////
    // Added a second one, different subSSH
    TxIOPair txio1(READHEX("00010000""0002""0002"), READ_UINT64_HEX_LE("0002000000000000"));
    ssh.insertTxio(txio1);
-   expect  = READHEX("0480""ffff0000""02""0102000000000000");
+   expect  = READHEX("0400""ffff0000""02""0102000000000000");
    expSub1 = READHEX("01""00""0100000000000000""0001""0001");
    expSub2 = READHEX("01""00""0002000000000000""0002""0002");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
 
    /////////////////////////////////////////////////////////////////////////////
    // Added another TxIO to the second subSSH
    TxIOPair txio2(READHEX("00010000""0004""0004"), READ_UINT64_HEX_LE("0000030000000000"));
    ssh.insertTxio(txio2);
-   expect  = READHEX("0480""ffff0000""03""0102030000000000");
+   expect  = READHEX("0400""ffff0000""03""0102030000000000");
    expSub1 = READHEX("01"
                        "00""0100000000000000""0001""0001");
    expSub2 = READHEX("02"
                        "00""0002000000000000""0002""0002"
                        "00""0000030000000000""0004""0004");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
 
    /////////////////////////////////////////////////////////////////////////////
    // Now we explicitly delete a TxIO (with pruning, this should be basically
    // equivalent to marking it spent, but we are DB-mode-agnostic here, testing
    // just the base insert/erase operations)
    ssh.eraseTxio(txio1);
-   expect  = READHEX("0480""ffff0000""02""0100030000000000");
+   expect  = READHEX("0400""ffff0000""02""0100030000000000");
    expSub1 = READHEX("01"
                        "00""0100000000000000""0001""0001");
    expSub2 = READHEX("01"
                        "00""0000030000000000""0004""0004");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
    
    /////////////////////////////////////////////////////////////////////////////
    // Insert a multisig TxIO -- this should increment totalTxioCount_, but not 
@@ -4077,39 +4317,39 @@ TEST_F(StoredBlockObjTest, SScriptHistorySer)
    TxIOPair txio3(READHEX("00010000""0006""0006"), READ_UINT64_HEX_LE("0000000400000000"));
    txio3.setMultisig(true);
    ssh.insertTxio(txio3);
-   expect  = READHEX("0480""ffff0000""03""0100030000000000");
+   expect  = READHEX("0400""ffff0000""03""0100030000000000");
    expSub1 = READHEX("01"
                        "00""0100000000000000""0001""0001");
    expSub2 = READHEX("02"
                        "00""0000030000000000""0004""0004"
                        "10""0000000400000000""0006""0006");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
    
    /////////////////////////////////////////////////////////////////////////////
    // Remove the multisig
    ssh.eraseTxio(txio3);
-   expect  = READHEX("0480""ffff0000""02""0100030000000000");
+   expect  = READHEX("0400""ffff0000""02""0100030000000000");
    expSub1 = READHEX("01"
                        "00""0100000000000000""0001""0001");
    expSub2 = READHEX("01"
                        "00""0000030000000000""0004""0004");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
 
    /////////////////////////////////////////////////////////////////////////////
    // Remove a full subSSH (it shouldn't be deleted, though, that will be done
    // by BlockUtils in a post-processing step
    ssh.eraseTxio(txio0);
-   expect  = READHEX("0480""ffff0000""01""0000030000000000");
+   expect  = READHEX("0400""ffff0000""01""0000030000000000");
    expSub1 = READHEX("00");
    expSub2 = READHEX("01"
                        "00""0000030000000000""0004""0004");
-   EXPECT_EQ(ssh.serializeDBValue(), expect);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("0000ff00")].serializeDBValue(), expSub1);
-   EXPECT_EQ(ssh.subHistMap_[READHEX("00010000")].serializeDBValue(), expSub2);
+   EXPECT_EQ(serializeDBValue(ssh, ARMORY_DB_BARE, DB_PRUNE_NONE), expect);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("0000ff00")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub1);
+   EXPECT_EQ(serializeDBValue(ssh.subHistMap_[READHEX("00010000")], nullptr, ARMORY_DB_BARE, DB_PRUNE_NONE), expSub2);
    
 }
 
@@ -4137,32 +4377,21 @@ TEST_F(StoredBlockObjTest, SScriptHistoryUnser)
    ssh.unserializeDBValue(toUnser);
 
    EXPECT_EQ(   ssh.subHistMap_.size(), 0);
-   EXPECT_FALSE(ssh.useMultipleEntries_);
    EXPECT_EQ(   ssh.alreadyScannedUpToBlk_, 65535);
    EXPECT_EQ(   ssh.totalTxioCount_, 0);
    EXPECT_EQ(   ssh.totalUnspent_, 0);
 
    /////////////////////////////////////////////////////////////////////////////
    ssh = sshorig;
-   toUnser = READHEX("0400""ffff0000""01""00""0100000000000000""0000ff00""0001""0001");
+   toUnser = READHEX("0400""ffff0000""01""0100000000000000");
    ssh.unserializeDBKey(DBPREF + uniq);
    ssh.unserializeDBValue(toUnser);
    BinaryData txioKey = hgtX0 + READHEX("00010001");
 
-   EXPECT_EQ(   ssh.subHistMap_.size(), 1);
-   EXPECT_FALSE(ssh.useMultipleEntries_);
    EXPECT_EQ(   ssh.alreadyScannedUpToBlk_, 65535);
    EXPECT_EQ(   ssh.totalTxioCount_, 1);
    EXPECT_EQ(   ssh.totalUnspent_, READ_UINT64_HEX_LE("0100000000000000"));
-   ASSERT_NE(   ssh.subHistMap_.find(hgtX0), ssh.subHistMap_.end());
-   StoredSubHistory & subssh = ssh.subHistMap_[hgtX0];
-   EXPECT_EQ(   subssh.uniqueKey_, uniq);
-   EXPECT_EQ(   subssh.hgtX_, hgtX0);
-   EXPECT_EQ(   subssh.txioSet_.size(), 1);
-   ASSERT_NE(   subssh.txioSet_.find(txioKey), subssh.txioSet_.end());
-   TxIOPair & txio = subssh.txioSet_[txioKey];
-   EXPECT_EQ(   txio.getValue(), READ_UINT64_HEX_LE("0100000000000000"));
-   EXPECT_EQ(   txio.getDBKeyOfOutput(), READHEX("0000ff0000010001"));
+
 
    /////////////////////////////////////////////////////////////////////////////
    // Test reading a subSSH and merging it with the regular SSH
@@ -4170,7 +4399,7 @@ TEST_F(StoredBlockObjTest, SScriptHistoryUnser)
    subssh1 = StoredSubHistory();
 
    ssh.unserializeDBKey(DBPREF + uniq);
-   ssh.unserializeDBValue(READHEX("0480""ffff0000""02""0000030400000000"));
+   ssh.unserializeDBValue(READHEX("0400""ffff0000""02""0000030400000000"));
    subssh1.unserializeDBKey(DBPREF + uniq + hgtX0);
    subssh1.unserializeDBValue(READHEX("02"
                                         "00""0000030000000000""0004""0004"
@@ -4185,21 +4414,20 @@ TEST_F(StoredBlockObjTest, SScriptHistoryUnser)
 
    // Unmerged, so SSH doesn't have the subSSH as part of it yet.
    EXPECT_EQ(   ssh.subHistMap_.size(), 0);
-   EXPECT_TRUE( ssh.useMultipleEntries_);
    EXPECT_EQ(   ssh.alreadyScannedUpToBlk_, 65535);
    EXPECT_EQ(   ssh.totalTxioCount_, 2);
    EXPECT_EQ(   ssh.totalUnspent_, READ_UINT64_HEX_LE("0000030400000000"));
 
    EXPECT_EQ(   subssh1.uniqueKey_,  uniq);
    EXPECT_EQ(   subssh1.hgtX_,       hgtX0);
-   EXPECT_EQ(   subssh1.txioSet_.size(), 2);
-   ASSERT_NE(   subssh1.txioSet_.find(txio0key), subssh1.txioSet_.end());
-   ASSERT_NE(   subssh1.txioSet_.find(txio1key), subssh1.txioSet_.end());
-   EXPECT_EQ(   subssh1.txioSet_[txio0key].getValue(), val0);
-   EXPECT_EQ(   subssh1.txioSet_[txio1key].getValue(), val1);
-   EXPECT_EQ(   subssh1.txioSet_[txio0key].getDBKeyOfOutput(), txio0key);
-   EXPECT_EQ(   subssh1.txioSet_[txio1key].getDBKeyOfOutput(), txio1key);
-   
+   EXPECT_EQ(   subssh1.txioMap_.size(), 2);
+   ASSERT_NE(   subssh1.txioMap_.find(txio0key), subssh1.txioMap_.end());
+   ASSERT_NE(   subssh1.txioMap_.find(txio1key), subssh1.txioMap_.end());
+   EXPECT_EQ(   subssh1.txioMap_[txio0key].getValue(), val0);
+   EXPECT_EQ(   subssh1.txioMap_[txio1key].getValue(), val1);
+   EXPECT_EQ(   subssh1.txioMap_[txio0key].getDBKeyOfOutput(), txio0key);
+   EXPECT_EQ(   subssh1.txioMap_[txio1key].getDBKeyOfOutput(), txio1key);
+
    ssh.mergeSubHistory(subssh1);
    EXPECT_EQ(   ssh.subHistMap_.size(), 1);
    ASSERT_NE(   ssh.subHistMap_.find(hgtX0), ssh.subHistMap_.end());
@@ -4207,13 +4435,13 @@ TEST_F(StoredBlockObjTest, SScriptHistoryUnser)
    StoredSubHistory & subref = ssh.subHistMap_[hgtX0];
    EXPECT_EQ(   subref.uniqueKey_, uniq);
    EXPECT_EQ(   subref.hgtX_,      hgtX0);
-   EXPECT_EQ(   subref.txioSet_.size(), 2);
-   ASSERT_NE(   subref.txioSet_.find(txio0key), subref.txioSet_.end());
-   ASSERT_NE(   subref.txioSet_.find(txio1key), subref.txioSet_.end());
-   EXPECT_EQ(   subref.txioSet_[txio0key].getValue(), val0);
-   EXPECT_EQ(   subref.txioSet_[txio1key].getValue(), val1);
-   EXPECT_EQ(   subref.txioSet_[txio0key].getDBKeyOfOutput(), txio0key);
-   EXPECT_EQ(   subref.txioSet_[txio1key].getDBKeyOfOutput(), txio1key);
+   EXPECT_EQ(   subref.txioMap_.size(), 2);
+   ASSERT_NE(   subref.txioMap_.find(txio0key), subref.txioMap_.end());
+   ASSERT_NE(   subref.txioMap_.find(txio1key), subref.txioMap_.end());
+   EXPECT_EQ(   subref.txioMap_[txio0key].getValue(), val0);
+   EXPECT_EQ(   subref.txioMap_[txio1key].getValue(), val1);
+   EXPECT_EQ(   subref.txioMap_[txio0key].getDBKeyOfOutput(), txio0key);
+   EXPECT_EQ(   subref.txioMap_[txio1key].getDBKeyOfOutput(), txio1key);
    
 
 
@@ -4233,8 +4461,8 @@ TEST_F(StoredBlockObjTest, SScriptHistoryUnser)
 /*
 TEST_F(StoredBlockObjTest, SScriptHistoryMarkSpent)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+   DBUtils::setArmoryDbType(ARMORY_DB_SUPER);
+   DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredScriptHistory ssh;
 
@@ -4326,7 +4554,7 @@ TEST_F(StoredBlockObjTest, SScriptHistoryMarkSpent)
    // In order for for these tests to work properly, the TxIns and TxOuts need
    // to look like they're in the main branch.  Se we set the valid dupID vals
    // so that txio.hasTxInInMain() and txio.hasTxOutInMain() both pass
-   LevelDBWrapper::GetInterfacePtr()->setValidDupIDForHeight(hgt,dup);
+   LSMWrapper::GetInterfacePtr()->setValidDupIDForHeight(hgt,dup);
 
    ssh.uniqueKey_ = HASH160PREFIX + a160;
    ssh.version_ = 1;
@@ -4362,18 +4590,47 @@ TEST_F(StoredBlockObjTest, SScriptHistoryMarkSpent)
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
-class LevelDBTest : public ::testing::Test
+class testBlockHeader : public BlockHeader
+{
+public:
+   void setBlockHeight(uint32_t height)
+   {
+      blockHeight_ = height;
+   }
+};
+
+class LMDBTest : public ::testing::Test
 {
 protected:
    virtual void SetUp(void) 
    {
-      iface_ = LevelDBWrapper::GetInterfacePtr();
+      #ifdef _MSC_VER
+         rmdir("./ldbtestdir");
+         mkdir("./ldbtestdir");
+      #else
+         system("rm -rf ./ldbtestdir/*");
+      #endif
+
+      auto isready = [](void)->bool { return true; };
+      iface_ = new LMDBBlockDatabase(isready);
       magic_ = READHEX(MAINNET_MAGIC_BYTES);
       ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
       gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
       zeros_ = READHEX("00000000");
-      DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
+         
+      config_.armoryDbType = ARMORY_DB_FULL;
+      config_.pruneType = DB_PRUNE_NONE;
+      config_.levelDBLocation = string("ldbtestdir");
+
+      config_.genesisBlockHash = ghash_;
+      config_.genesisTxHash = gentx_;
+      config_.magicBytes = magic_;
+
+      // Make sure the global DB type and prune type are reset for each test
+      //iface_->openDatabases( ldbdir_, ghash_, gentx_, magic_, 
+      //                        ARMORY_DB_BARE, DB_PRUNE_NONE);
+//       DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//       DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
       rawHead_ = READHEX(
          "01000000"
@@ -4560,11 +4817,9 @@ protected:
       bh_.unserialize(rawHead_);
       tx1_.unserialize(rawTx0_);
       tx2_.unserialize(rawTx1_);
-      sbh_.unserialize(rawHead_);
+      sbh_.setHeaderData(rawHead_);
 
-      // Make sure the global DB type and prune type are reset for each test
-      DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
+      LOGDISABLESTDOUT();
    }
 
    /////
@@ -4572,13 +4827,16 @@ protected:
    {
       // This seem to be the best way to remove a dir tree in C++ (in Linux)
       iface_->closeDatabases();
+      delete iface_;
       iface_ = NULL;
 
       #ifdef _MSC_VER
-         rmdir("./ldbtestdir/level*");
+         rmdir("./ldbtestdir/*");
       #else
-         system("rm -rf ./ldbtestdir/level*");
+         system("rm -rf ./ldbtestdir/*");
       #endif
+
+      CLEANUP_ALL_TIMERS();
    }
 
    /////
@@ -4645,7 +4903,7 @@ protected:
          return false;
       }
 
-      fromDB = iface_->getAllDatabaseEntries(BLKDATA);
+      fromDB = iface_->getAllDatabaseEntries(HISTORY);
       if(fromDB.size() < endplus1B || expectOutB_.size() < endplus1B)
       {
          LOGERR << "BLKDATA DB not the correct size";
@@ -4675,10 +4933,15 @@ protected:
    /////
    bool standardOpenDBs(void) 
    {
-      
-      iface_->openDatabases( string("ldbtestdir"), 
-                             ghash_, gentx_, magic_, 
-                             ARMORY_DB_FULL, DB_PRUNE_NONE);
+      iface_->openDatabases(
+         config_.levelDBLocation,
+         config_.genesisBlockHash,
+         config_.genesisTxHash,
+         config_.magicBytes,
+         config_.armoryDbType,
+         config_.pruneType);
+
+      LMDBEnv::Transaction tx(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
 
       BinaryData DBINFO = StoredDBInfo().getDBKey();
       BinaryData flags = READHEX("03100000");
@@ -4690,7 +4953,8 @@ protected:
    }
 
 
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
+   BlockDataManagerConfig config_;
    vector<pair<BinaryData, BinaryData> > expectOutH_;
    vector<pair<BinaryData, BinaryData> > expectOutB_;
 
@@ -4718,22 +4982,23 @@ protected:
 
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, OpenClose)
+TEST_F(LMDBTest, OpenClose)
 {
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
-   
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
    ASSERT_TRUE(iface_->databasesAreOpen());
 
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 0);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), READHEX(MAINNET_GENESIS_HASH_HEX));
+   EXPECT_EQ(READHEX(MAINNET_GENESIS_HASH_HEX), iface_->getTopBlockHash(HEADERS));
                           
    KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
-   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
+   KVLIST BList = iface_->getAllDatabaseEntries(HISTORY);
 
    // 0123 4567 0123 4567
    // 0000 0010 0001 ---- ---- ---- ---- ----
@@ -4756,32 +5021,35 @@ TEST_F(LevelDBTest, OpenClose)
 
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, OpenCloseOpenNominal)
+TEST_F(LMDBTest, OpenCloseOpenNominal)
 {
    // 0123 4567 0123 4567
    // 0000 0010 0001 ---- ---- ---- ---- ----
    BinaryData flags = READHEX("03100000");
 
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
 
 
    iface_->closeDatabases();
 
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
    ASSERT_TRUE(iface_->databasesAreOpen());
 
    KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
-   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
+   KVLIST BList = iface_->getAllDatabaseEntries(HISTORY);
 
    for(uint32_t i=0; i<HList.size(); i++)
    {
@@ -4798,79 +5066,24 @@ TEST_F(LevelDBTest, OpenCloseOpenNominal)
    iface_->closeDatabases();
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, DISABLED_OpenCloseOpenMismatch)
-{
-   LOGERR << "Expecting four error messages here:  this is normal";
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
-   EXPECT_TRUE(iface_->databasesAreOpen());
-   iface_->closeDatabases();
-
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_.getSliceCopy(0, 31) + READHEX("00"),
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
-   EXPECT_TRUE(iface_->databasesAreOpen());
-   iface_->closeDatabases();
-
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_.getSliceCopy(0,3) + READHEX("00"),
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
-   EXPECT_FALSE(iface_->databasesAreOpen());
-
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_SUPER,
-                          DB_PRUNE_WHATEVER);
-   EXPECT_FALSE(iface_->databasesAreOpen());
-
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_);
-   ASSERT_TRUE( iface_->databasesAreOpen());
-
-   EXPECT_EQ(   DBUtils.getArmoryDbType(), ARMORY_DB_FULL);
-   EXPECT_EQ(   DBUtils.getDbPruneType(),  DB_PRUNE_NONE);
-
-   KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
-   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
-
-   EXPECT_EQ(HList.begin()->first,  READHEX("00"));
-   EXPECT_EQ(BList.begin()->first,  READHEX("00"));
-                         
-   iface_->closeDatabases();
-   
-   
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutGetDelete)
+TEST_F(LMDBTest, PutGetDelete)
 {
    BinaryData flags = READHEX("03100000");
 
-   iface_->openDatabases( string("ldbtestdir"),
-                          ghash_,
-                          gentx_,
-                          magic_,
-                          ARMORY_DB_FULL,
-                          DB_PRUNE_NONE);
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
    ASSERT_TRUE(iface_->databasesAreOpen());
    
+   LMDBEnv::Transaction txh(iface_->dbEnv_[HEADERS].get(), LMDB::ReadWrite);
+   LMDBEnv::Transaction txH(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
+
    DB_PREFIX TXDATA = DB_PREFIX_TXDATA;
    BinaryData DBINFO = StoredDBInfo().getDBKey();
    BinaryData PREFIX = WRITE_UINT8_BE((uint8_t)TXDATA);
@@ -4887,38 +5100,40 @@ TEST_F(LevelDBTest, PutGetDelete)
 
    ASSERT_TRUE( compareKVListRange(0,1, 0,1));
 
-   iface_->putValue(BLKDATA, keyAB, commonValue);
+   iface_->putValue(HISTORY, keyAB, commonValue);
    ASSERT_TRUE( compareKVListRange(0,1, 0,2));
 
-   iface_->putValue(BLKDATA, DB_PREFIX_TXDATA, keyAB, commonValue);
+   iface_->putValue(HISTORY, DB_PREFIX_TXDATA, keyAB, commonValue);
    ASSERT_TRUE( compareKVListRange(0,1, 0,3));
 
    // Now test a bunch of get* methods
-   ASSERT_EQ( iface_->getValue(      BLKDATA, PREFIX+keyAB),             commonValue);
-   ASSERT_EQ( iface_->getValue(      BLKDATA, DB_PREFIX_DBINFO, nothing),val0);
-   ASSERT_EQ( iface_->getValue(      BLKDATA, DBINFO),                   val0);
-   ASSERT_EQ( iface_->getValueRef(   BLKDATA, PREFIX+keyAB),             commonValue);
-   ASSERT_EQ( iface_->getValueRef(   BLKDATA, TXDATA, keyAB),            commonValue);
-   ASSERT_EQ( iface_->getValueReader(BLKDATA, PREFIX+keyAB).getRawRef(), commonValue);
-   ASSERT_EQ( iface_->getValueReader(BLKDATA, TXDATA, keyAB).getRawRef(),commonValue);
+   ASSERT_EQ(iface_->getValue(      HISTORY, PREFIX + keyAB), commonValue);
+   ASSERT_EQ(iface_->getValue(      HISTORY, DB_PREFIX_DBINFO, nothing), val0);
+   ASSERT_EQ(iface_->getValue(      HISTORY, DBINFO), val0);
+   ASSERT_EQ(iface_->getValueRef(   HISTORY, PREFIX + keyAB), commonValue);
+   ASSERT_EQ(iface_->getValueRef(   HISTORY, TXDATA, keyAB), commonValue);
+   ASSERT_EQ(iface_->getValueReader(HISTORY, PREFIX + keyAB).getRawRef(), commonValue);
+   ASSERT_EQ(iface_->getValueReader(HISTORY, TXDATA, keyAB).getRawRef(), commonValue);
 
-   iface_->deleteValue(BLKDATA, DB_PREFIX_TXDATA, keyAB);
+   iface_->deleteValue(HISTORY, DB_PREFIX_TXDATA, keyAB);
    ASSERT_TRUE( compareKVListRange(0,1, 0,2));
 
-   iface_->deleteValue(BLKDATA, PREFIX+ keyAB);
+   iface_->deleteValue(HISTORY, PREFIX + keyAB);
    ASSERT_TRUE( compareKVListRange(0,1, 0,1));
 
-   iface_->deleteValue(BLKDATA, PREFIX+ keyAB);
+   iface_->deleteValue(HISTORY, PREFIX + keyAB);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, STxOutPutGet)
+TEST_F(LMDBTest, STxOutPutGet)
 {
    BinaryData TXP     = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
    BinaryData stxoVal = READHEX("0400") + rawTxOut0_;
    BinaryData stxoKey = TXP + READHEX("01e078""0f""0007""0001");
    
    ASSERT_TRUE(standardOpenDBs());
+   LMDBEnv::Transaction txh(iface_->dbEnv_[HEADERS].get(), LMDB::ReadWrite);
+   LMDBEnv::Transaction txH(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
 
    StoredTxOut stxo0;
    stxo0.txVersion_   = 1;
@@ -4936,11 +5151,14 @@ TEST_F(LevelDBTest, STxOutPutGet)
 
    StoredTxOut stxoGet;
    iface_->getStoredTxOut(stxoGet, 123000, 15, 7, 1);
-   EXPECT_EQ(stxoGet.serializeDBValue(), stxo0.serializeDBValue());
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE)
+   );
 
    //iface_->validDupByHeight_[123000] = 15;
    //iface_->getStoredTxOut(stxoGet, 123000, 7, 1);
-   //EXPECT_EQ(stxoGet.serializeDBValue(), stxo0.serializeDBValue());
+   //EXPECT_EQ(serializeDBValue(stxoGet), serializeDBValue(stxo0));
    
    StoredTxOut stxo1;
    stxo1.txVersion_   = 1;
@@ -4955,9 +5173,15 @@ TEST_F(LevelDBTest, STxOutPutGet)
    iface_->putStoredTxOut(stxo1);
 
    iface_->getStoredTxOut(stxoGet, 123000, 15, 7, 1);
-   EXPECT_EQ(stxoGet.serializeDBValue(), stxo0.serializeDBValue());
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE)
+   );
    iface_->getStoredTxOut(stxoGet, 200333,  3, 7, 1);
-   EXPECT_EQ(stxoGet.serializeDBValue(), stxo1.serializeDBValue());
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo1, ARMORY_DB_FULL, DB_PRUNE_NONE)
+   );
 
    addOutPairB(stxoKey, stxoVal);
    ASSERT_TRUE(compareKVListRange(0,1, 0,3));
@@ -4965,78 +5189,10 @@ TEST_F(LevelDBTest, STxOutPutGet)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutFullTxNoOuts)
+TEST_F(LMDBTest, PutFullBlockNoTx)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-
-   ASSERT_TRUE(standardOpenDBs());
-
-   StoredTx stx;
-   stx.createFromTx(rawTxUnfrag_);
-   stx.setKeyData(123000, 15, 7);
-
-   BinaryData TXP     = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
-   BinaryData stxKey  = TXP + READHEX("01e078""0f""0007");
-   BinaryData stxVal  = READHEX("0440") + stx.thisHash_ + rawTxFragged_;
-
-   iface_->putStoredTx(stx, false);
-   addOutPairB(stxKey,  stxVal);
-   EXPECT_TRUE(compareKVListRange(0,1, 0,2));
-}
-
-////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutFullTx)
-{
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-
-   BinaryData TXP     = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
-   BinaryData stxoVal = READHEX("0400") + rawTxOut0_;
-   BinaryData stxKey   = TXP + READHEX("01e078""0f""0007");
-   BinaryData stxo0Key = TXP + READHEX("01e078""0f""0007""0000");
-   BinaryData stxo1Key = TXP + READHEX("01e078""0f""0007""0001");
-   BinaryData stxo0raw = READHEX(
-      "ac4c8bd5000000001976a9148dce8946f1c7763bb60ea5cf16ef514cbed0633b88ac");
-   BinaryData stxo1raw = READHEX(
-      "002f6859000000001976a9146a59ac0e8f553f292dfe5e9f3aaa1da93499c15e88ac");
-   
-   ASSERT_TRUE(standardOpenDBs());
-
-   StoredTx stx;
-   stx.createFromTx(rawTxUnfrag_);
-   stx.setKeyData(123000, 15, 7);
-
-   ASSERT_EQ(stx.stxoMap_.size(), 2);
-   for(uint32_t i=0; i<2; i++)
-   {
-      stx.stxoMap_[i].spentness_  = TXOUT_UNSPENT;
-      stx.stxoMap_[i].isCoinbase_ = false;
-
-      ASSERT_EQ(stx.stxoMap_[i].blockHeight_, 123000);
-      ASSERT_EQ(stx.stxoMap_[i].duplicateID_,     15);
-      ASSERT_EQ(stx.stxoMap_[i].txIndex_,          7);
-      ASSERT_EQ(stx.stxoMap_[i].txOutIndex_,       i);
-      ASSERT_EQ(stx.stxoMap_[i].isCoinbase_,   false);
-   }
-
-   BinaryData stxVal = READHEX("0440") + stx.thisHash_ + rawTxFragged_;
-   BinaryData stxo0Val = READHEX("0400") + stxo0raw;
-   BinaryData stxo1Val = READHEX("0400") + stxo1raw;
-
-   iface_->putStoredTx(stx);
-   addOutPairB(stxKey,  stxVal);
-   addOutPairB(stxo0Key, stxo0Val);
-   addOutPairB(stxo1Key, stxo1Val);
-   EXPECT_TRUE(compareKVListRange(0,1, 0,4));
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutFullBlockNoTx)
-{
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredHeader sbh;
    BinaryRefReader brr(rawBlock_);
@@ -5053,30 +5209,40 @@ TEST_F(LevelDBTest, PutFullBlockNoTx)
    BinaryData HGP   = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHGT);
    BinaryData hgtx  = READHEX("01e078""00");
    BinaryData sbh_HH_key = HHP + sbh.thisHash_;
-   BinaryData sbh_HH_val = sbh.dataCopy_ + hgtx;
+   BinaryData sbh_HH_val = sbh.dataCopy_ + hgtx + READHEX("46040000");
    BinaryData sbh_HG_key = hhl.getDBKey();
    BinaryData sbh_HG_val = hhl.serializeDBValue();
    
    ASSERT_TRUE(standardOpenDBs());
+   LMDBEnv::Transaction txh(iface_->dbEnv_[HEADERS].get(), LMDB::ReadWrite);
+   LMDBEnv::Transaction txH(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
 
    addOutPairH( sbh_HH_key, sbh_HH_val);
    addOutPairH( sbh_HG_key, sbh_HG_val);
 
-   uint8_t sdup = iface_->putStoredHeader(sbh, false);
-   EXPECT_TRUE(compareKVListRange(0,3, 0,1));
+   brr.resetPosition();
+   testBlockHeader bh;
+   bh.unserialize(brr);
+   bh.setDuplicateID(0);
+   bh.setBlockHeight(123000);
+
+   auto getBH = [&](const BinaryData& hash)->const BlockHeader&
+   { return bh; };
+   uint8_t sdup = iface_->putRawBlockData(brr, getBH);
+   EXPECT_TRUE(compareKVListRange(0,1, 0,1));
    EXPECT_EQ(sdup, 0);
 
    // Try adding it again and see if get the correct dup again, and no touch DB
-   sdup = iface_->putStoredHeader(sbh, false);
-   EXPECT_TRUE(compareKVListRange(0,3, 0,1));
+   sdup = iface_->putRawBlockData(brr, getBH);
+   EXPECT_TRUE(compareKVListRange(0,1, 0, 1));
    EXPECT_EQ(sdup, 0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutGetBareHeader)
+TEST_F(LMDBTest, PutGetBareHeader)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    StoredHeader sbh;
    BinaryRefReader brr(rawBlock_);
@@ -5085,13 +5251,10 @@ TEST_F(LevelDBTest, PutGetBareHeader)
    BinaryData header0 = sbh.thisHash_;
 
    ASSERT_TRUE(standardOpenDBs());
+   LMDBEnv::Transaction txh(iface_->dbEnv_[HEADERS].get(), LMDB::ReadWrite);
+   LMDBEnv::Transaction txH(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
 
    uint8_t sdup = iface_->putBareHeader(sbh);
-   EXPECT_EQ(sdup, 0);
-   EXPECT_EQ(sbh.duplicateID_, 0);
-
-   // Try adding it again and see if get the correct dup again, and no touch DB
-   sdup = iface_->putStoredHeader(sbh, false);
    EXPECT_EQ(sdup, 0);
    EXPECT_EQ(sbh.duplicateID_, 0);
 
@@ -5103,7 +5266,7 @@ TEST_F(LevelDBTest, PutGetBareHeader)
    BinaryData header1 = BtcUtils::getHash256(newHeader);
 
    StoredHeader sbh2;
-   sbh2.unserialize(newHeader);
+   sbh2.setHeaderData(newHeader);
    sbh2.setKeyData(123000, UINT8_MAX);
    
    uint8_t newDup = iface_->putBareHeader(sbh2);
@@ -5118,7 +5281,7 @@ TEST_F(LevelDBTest, PutGetBareHeader)
       "b4450081d8c8c84db3936a1a334b035b");
    BinaryData header2 = BtcUtils::getHash256(anotherHead);
 
-   sbh3.unserialize(anotherHead);
+   sbh3.setHeaderData(anotherHead);
    sbh3.setKeyData(123000, UINT8_MAX);
    sbh3.isMainBranch_ = true;
    uint8_t anotherDup = iface_->putBareHeader(sbh3);
@@ -5140,14 +5303,13 @@ TEST_F(LevelDBTest, PutGetBareHeader)
    iface_->putBareHeader(sbh3);
    EXPECT_EQ(sbh3.duplicateID_, 2);
    EXPECT_EQ(iface_->getValidDupIDForHeight(123000), 2);
-   
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutFullBlock)
+TEST_F(LMDBTest, DISABLED_PutFullBlock)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
    ASSERT_TRUE(standardOpenDBs());
 
    StoredHeader sbh;
@@ -5168,7 +5330,7 @@ TEST_F(LevelDBTest, PutFullBlock)
    BinaryData HHP   = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHASH);
    BinaryData HGP   = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHGT);
    BinaryData sbh_HH_key = HHP + sbh.thisHash_;
-   BinaryData sbh_HH_val = rawHeader + READHEX("01e078""00");
+   BinaryData sbh_HH_val = rawHeader + READHEX("01e078""00") + READHEX("46040000");
    BinaryData sbh_HG_key = hhl.getDBKey();
    BinaryData sbh_HG_val = hhl.serializeDBValue();
    // Only HEADHASH and HEADHGT entries get written
@@ -5254,10 +5416,10 @@ TEST_F(LevelDBTest, PutFullBlock)
 // require a saved state, it just re-puts the full block into the DB).  I
 // did it this way, because I wasn't comfortable committing the pre-filled
 // DB to the repo.
-TEST_F(LevelDBTest, GetFullBlock)
+TEST_F(LMDBTest, DISABLED_GetFullBlock)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
    ASSERT_TRUE(standardOpenDBs());
 
    StoredHeader sbh;
@@ -5341,9 +5503,10 @@ TEST_F(LevelDBTest, GetFullBlock)
 
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutGetStoredTxHints)
+TEST_F(LMDBTest, PutGetStoredTxHints)
 {
    ASSERT_TRUE(standardOpenDBs());
+   LMDBEnv::Transaction tx(iface_->dbEnv_[TXHINTS].get(), LMDB::ReadWrite);
 
    BinaryData prefix = READHEX("aabbccdd");
 
@@ -5395,13 +5558,14 @@ TEST_F(LevelDBTest, PutGetStoredTxHints)
 
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, PutGetStoredScriptHistory)
+TEST_F(LMDBTest, PutGetStoredScriptHistory)
 {
    ASSERT_TRUE(standardOpenDBs());
+   LMDBEnv::Transaction tx(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
 
    ///////////////////////////////////////////////////////////////////////////
    // A whole bunch of setup stuff we need for SSH operations to work right
-   InterfaceToLDB * iface = LevelDBWrapper::GetInterfacePtr();
+   LMDBBlockDatabase *const iface = iface_;
    iface->setValidDupIDForHeight(255,0);
    iface->setValidDupIDForHeight(256,0);
 
@@ -5425,10 +5589,10 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
          "00001976a914c1b4695d53b6ee57a28647ce63e45665df6762c288ac80d1f008"
          "000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac0000"
          "0000");
-   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey0, RAWTX);
-   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey1, RAWTX);
-   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey2, RAWTX);
-   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey3, RAWTX);
+   iface->putValue(HISTORY, DB_PREFIX_TXDATA, dbkey0, RAWTX);
+   iface->putValue(HISTORY, DB_PREFIX_TXDATA, dbkey1, RAWTX);
+   iface->putValue(HISTORY, DB_PREFIX_TXDATA, dbkey2, RAWTX);
+   iface->putValue(HISTORY, DB_PREFIX_TXDATA, dbkey3, RAWTX);
 
    TxIOPair txio0(dbkey0, val0);
    TxIOPair txio1(dbkey1, val1);
@@ -5482,9 +5646,9 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
    subptr = &sshtemp.subHistMap_[hgtX0];
    EXPECT_EQ(subptr->uniqueKey_, uniq);
    EXPECT_EQ(subptr->hgtX_, hgtX0);
-   ASSERT_EQ(subptr->txioSet_.size(), 1);
-   ASSERT_NE(subptr->txioSet_.find(dbkey0), subptr->txioSet_.end());
-   txioptr = &subptr->txioSet_[dbkey0];
+   ASSERT_EQ(subptr->txioMap_.size(), 1);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
    EXPECT_EQ(txioptr->getValue(), val0);
    EXPECT_FALSE(txioptr->isMultisig());
@@ -5508,13 +5672,13 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
    subptr = &sshtemp.subHistMap_[hgtX0];
    EXPECT_EQ(subptr->uniqueKey_, uniq);
    EXPECT_EQ(subptr->hgtX_, hgtX0);
-   ASSERT_EQ(subptr->txioSet_.size(), 2);
-   ASSERT_NE(subptr->txioSet_.find(dbkey0), subptr->txioSet_.end());
-   txioptr = &subptr->txioSet_[dbkey0];
+   ASSERT_EQ(subptr->txioMap_.size(), 2);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
    EXPECT_EQ(txioptr->getValue(), val0);
    EXPECT_FALSE(txioptr->isMultisig());
-   txioptr = &subptr->txioSet_[dbkey1];
+   txioptr = &subptr->txioMap_[dbkey1];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey1);
    EXPECT_EQ(txioptr->getValue(), val1);
    EXPECT_FALSE(txioptr->isMultisig());
@@ -5540,12 +5704,12 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
    subptr = &sshtemp.subHistMap_[hgtX0];
    EXPECT_EQ(subptr->uniqueKey_, uniq);
    EXPECT_EQ(subptr->hgtX_, hgtX0);
-   ASSERT_EQ(subptr->txioSet_.size(), 2);
-   ASSERT_NE(subptr->txioSet_.find(dbkey0), subptr->txioSet_.end());
-   txioptr = &subptr->txioSet_[dbkey0];
+   ASSERT_EQ(subptr->txioMap_.size(), 2);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
    EXPECT_EQ(txioptr->getValue(), val0);
-   txioptr = &subptr->txioSet_[dbkey1];
+   txioptr = &subptr->txioMap_[dbkey1];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey1);
    EXPECT_EQ(txioptr->getValue(), val1);
    EXPECT_FALSE(txioptr->isMultisig());
@@ -5554,9 +5718,9 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
    subptr = &sshtemp.subHistMap_[hgtX1];
    EXPECT_EQ(subptr->uniqueKey_, uniq);
    EXPECT_EQ(subptr->hgtX_, hgtX1);
-   ASSERT_EQ(subptr->txioSet_.size(), 1);
-   ASSERT_NE(subptr->txioSet_.find(dbkey3), subptr->txioSet_.end());
-   txioptr = &subptr->txioSet_[dbkey3];
+   ASSERT_EQ(subptr->txioMap_.size(), 1);
+   ASSERT_NE(subptr->txioMap_.find(dbkey3), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey3];
    EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey3);
    EXPECT_EQ(txioptr->getValue(), val3);
    EXPECT_TRUE(txioptr->isMultisig());
@@ -5564,16 +5728,1263 @@ TEST_F(LevelDBTest, PutGetStoredScriptHistory)
 
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(LevelDBTest, DISABLED_PutGetStoredUndoData)
+TEST_F(LMDBTest, DISABLED_PutGetStoredUndoData)
 {
    // We don't actually use undo data at all yet, so I'll skip the tests for now
 }
 
 
-TEST_F(LevelDBTest, HeaderDump)
+TEST_F(LMDBTest, HeaderDump)
 {
    // We don't actually use undo data at all yet, so I'll skip the tests for now
 }
+
+class LMDBTest_Super : public ::testing::Test
+{
+protected:
+   virtual void SetUp(void)
+   {
+#ifdef _MSC_VER
+      rmdir("./ldbtestdir");
+      mkdir("./ldbtestdir");
+#else
+      system("rm -rf ./ldbtestdir/*");
+#endif
+
+      auto isready = [](void)->bool { return true; };
+      iface_ = new LMDBBlockDatabase(isready);
+      magic_ = READHEX(MAINNET_MAGIC_BYTES);
+      ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
+      gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+      zeros_ = READHEX("00000000");
+
+      config_.armoryDbType = ARMORY_DB_SUPER;
+      config_.pruneType = DB_PRUNE_NONE;
+      config_.levelDBLocation = string("ldbtestdir");
+
+      config_.genesisBlockHash = ghash_;
+      config_.genesisTxHash = gentx_;
+      config_.magicBytes = magic_;
+
+      // Make sure the global DB type and prune type are reset for each test
+      //iface_->openDatabases( ldbdir_, ghash_, gentx_, magic_, 
+      //                        ARMORY_DB_BARE, DB_PRUNE_NONE);
+      //       DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+      //       DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+      rawHead_ = READHEX(
+         "01000000"
+         "1d8f4ec0443e1f19f305e488c1085c95de7cc3fd25e0d2c5bb5d000000000000"
+         "9762547903d36881a86751f3f5049e23050113f779735ef82734ebf0b4450081"
+         "d8c8c84d"
+         "b3936a1a"
+         "334b035b");
+      headHashLE_ = READHEX(
+         "1195e67a7a6d0674bbd28ae096d602e1f038c8254b49dfe79d47000000000000");
+      headHashBE_ = READHEX(
+         "000000000000479de7df494b25c838f0e102d696e08ad2bb74066d7a7ae69511");
+
+      rawTx0_ = READHEX(
+         "01000000016290dce984203b6a5032e543e9e272d8bce934c7de4d15fa0fe44d"
+         "d49ae4ece9010000008b48304502204f2fa458d439f957308bca264689aa175e"
+         "3b7c5f78a901cb450ebd20936b2c500221008ea3883a5b80128e55c9c6070aa6"
+         "264e1e0ce3d18b7cd7e85108ce3d18b7419a0141044202550a5a6d3bb81549c4"
+         "a7803b1ad59cdbba4770439a4923624a8acfc7d34900beb54a24188f7f0a4068"
+         "9d905d4847cc7d6c8d808a457d833c2d44ef83f76bffffffff0242582c0a0000"
+         "00001976a914c1b4695d53b6ee57a28647ce63e45665df6762c288ac80d1f008"
+         "000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac0000"
+         "0000");
+      rawTx1_ = READHEX(
+         "0100000001f658dbc28e703d86ee17c9a2d3b167a8508b082fa0745f55be5144"
+         "a4369873aa010000008c49304602210041e1186ca9a41fdfe1569d5d807ca7ff"
+         "6c5ffd19d2ad1be42f7f2a20cdc8f1cc0221003366b5d64fe81e53910e156914"
+         "091d12646bc0d1d662b7a65ead3ebe4ab8f6c40141048d103d81ac9691cf13f3"
+         "fc94e44968ef67b27f58b27372c13108552d24a6ee04785838f34624b294afee"
+         "83749b64478bb8480c20b242c376e77eea2b3dc48b4bffffffff0200e1f50500"
+         "0000001976a9141b00a2f6899335366f04b277e19d777559c35bc888ac40aeeb"
+         "02000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac00"
+         "000000");
+
+      rawBlock_ = READHEX(
+         // Header
+         "01000000eb10c9a996a2340a4d74eaab41421ed8664aa49d18538bab59010000"
+         "000000005a2f06efa9f2bd804f17877537f2080030cadbfa1eb50e02338117cc"
+         "604d91b9b7541a4ecfbb0a1a64f1ade7"
+         // 3 transactions
+         "03"
+         ///// Tx0, version
+         "01000000"
+         "01"
+         // Tx0, Txin0
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "ffffffff"
+         "08""04cfbb0a1a02360a""ffffffff"
+         // Tx0, 1 TxOut
+         "01"
+         // Tx0, TxOut0
+         "00f2052a01000000"
+         "434104c2239c4eedb3beb26785753463be3ec62b82f6acd62efb65f452f8806f"
+         "2ede0b338e31d1f69b1ce449558d7061aa1648ddc2bf680834d3986624006a27"
+         "2dc21cac"
+         // Tx0, Locktime
+         "00000000"
+         ///// Tx1, Version 
+         "01000000"
+         // Tx1, 3 txins
+         "03"
+         // Tx1, TxIn0
+         "e8caa12bcb2e7e86499c9de49c45c5a1c6167ea4b894c8c83aebba1b6100f343"
+         "01000000"
+         "8c493046022100e2f5af5329d1244807f8347a2c8d9acc55a21a5db769e9274e"
+         "7e7ba0bb605b26022100c34ca3350df5089f3415d8af82364d7f567a6a297fcc"
+         "2c1d2034865633238b8c014104129e422ac490ddfcb7b1c405ab9fb42441246c"
+         "4bca578de4f27b230de08408c64cad03af71ee8a3140b40408a7058a1984a9f2"
+         "46492386113764c1ac132990d1""ffffffff"
+         // Tx1, TxIn1
+         "5b55c18864e16c08ef9989d31c7a343e34c27c30cd7caa759651b0e08cae0106"
+         "00000000"
+         "8c4930460221009ec9aa3e0caf7caa321723dea561e232603e00686d4bfadf46"
+         "c5c7352b07eb00022100a4f18d937d1e2354b2e69e02b18d11620a6a9332d563"
+         "e9e2bbcb01cee559680a014104411b35dd963028300e36e82ee8cf1b0c8d5bf1"
+         "fc4273e970469f5cb931ee07759a2de5fef638961726d04bd5eb4e5072330b9b"
+         "371e479733c942964bb86e2b22""ffffffff"
+         // Tx1, TxIn2
+         "3de0c1e913e6271769d8c0172cea2f00d6d3240afc3a20f9fa247ce58af30d2a"
+         "01000000"
+         "8c493046022100b610e169fd15ac9f60fe2b507529281cf2267673f4690ba428"
+         "cbb2ba3c3811fd022100ffbe9e3d71b21977a8e97fde4c3ba47b896d08bc09ec"
+         "b9d086bb59175b5b9f03014104ff07a1833fd8098b25f48c66dcf8fde34cbdbc"
+         "c0f5f21a8c2005b160406cbf34cc432842c6b37b2590d16b165b36a3efc9908d"
+         "65fb0e605314c9b278f40f3e1a""ffffffff"
+         // Tx1, 2 TxOuts
+         "02"
+         // Tx1, TxOut0
+         "40420f0000000000""19""76a914adfa66f57ded1b655eb4ccd96ee07ca62bc1ddfd88ac"
+         // Tx1, TxOut1
+         "007d6a7d04000000""19""76a914981a0c9ae61fa8f8c96ae6f8e383d6e07e77133e88ac"
+         // Tx1 Locktime
+         "00000000"
+         ///// Tx2 Version
+         "01000000"
+         // Tx2 1 TxIn
+         "01"
+         "38e7586e0784280df58bd3dc5e3d350c9036b1ec4107951378f45881799c92a4"
+         "00000000"
+         "8a47304402207c945ae0bbdaf9dadba07bdf23faa676485a53817af975ddf85a"
+         "104f764fb93b02201ac6af32ddf597e610b4002e41f2de46664587a379a01613"
+         "23a85389b4f82dda014104ec8883d3e4f7a39d75c9f5bb9fd581dc9fb1b7cdf7"
+         "d6b5a665e4db1fdb09281a74ab138a2dba25248b5be38bf80249601ae688c90c"
+         "6e0ac8811cdb740fcec31d""ffffffff"
+         // Tx2, 2 TxOuts
+         "02"
+         // Tx2, TxOut0
+         "2f66ac6105000000""19""76a914964642290c194e3bfab661c1085e47d67786d2d388ac"
+         // Tx2, TxOut1
+         "2f77e20000000000""19""76a9141486a7046affd935919a3cb4b50a8a0c233c286c88ac"
+         // Tx2 Locktime
+         "00000000");
+
+      rawTxUnfrag_ = READHEX(
+         // Version
+         "01000000"
+         // NumTxIn
+         "02"
+         // Start TxIn0
+         "0044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0"
+         "ebf6a69324010000008a47304402206568144ed5e7064d6176c74738b04c08ca"
+         "19ca54ddeb480084b77f45eebfe57802207927d6975a5ac0e1bb36f5c05356dc"
+         "da1f521770511ee5e03239c8e1eecf3aed0141045d74feae58c4c36d7c35beac"
+         "05eddddc78b3ce4b02491a2eea72043978056a8bc439b99ddaad327207b09ef1"
+         "6a8910828e805b0cc8c11fba5caea2ee939346d7ffffffff"
+         // Start TxIn1
+         "45c866b219b17695"
+         "2508f8e5aea728f950186554fc4a5807e2186a8e1c4009e5000000008c493046"
+         "022100bd5d41662f98cfddc46e86ea7e4a3bc8fe9f1dfc5c4836eaf7df582596"
+         "cfe0e9022100fc459ae4f59b8279d679003b88935896acd10021b6e2e4619377"
+         "e336b5296c5e014104c00bab76a708ba7064b2315420a1c533ca9945eeff9754"
+         "cdc574224589e9113469b4e71752146a10028079e04948ecdf70609bf1b9801f"
+         "6b73ab75947ac339e5ffffffff"
+         // NumTxOut
+         "02"
+         // Start TxOut0
+         "ac4c8bd5000000001976a9148dce8946f1c7763bb60ea5cf16ef514cbed0633b88ac"
+         // Start TxOut1
+         "002f6859000000001976a9146a59ac0e8f553f292dfe5e9f3aaa1da93499c15e88ac"
+         // Locktime
+         "00000000");
+
+      rawTxFragged_ = READHEX(
+         // Version
+         "01000000"
+         // NumTxIn
+         "02"
+         // Start TxIn0
+         "0044fbc929d78e4203eed6f1d3d39c0157d8e5c100bbe0886779c0"
+         "ebf6a69324010000008a47304402206568144ed5e7064d6176c74738b04c08ca"
+         "19ca54ddeb480084b77f45eebfe57802207927d6975a5ac0e1bb36f5c05356dc"
+         "da1f521770511ee5e03239c8e1eecf3aed0141045d74feae58c4c36d7c35beac"
+         "05eddddc78b3ce4b02491a2eea72043978056a8bc439b99ddaad327207b09ef1"
+         "6a8910828e805b0cc8c11fba5caea2ee939346d7ffffffff"
+         // Start TxIn1
+         "45c866b219b17695"
+         "2508f8e5aea728f950186554fc4a5807e2186a8e1c4009e5000000008c493046"
+         "022100bd5d41662f98cfddc46e86ea7e4a3bc8fe9f1dfc5c4836eaf7df582596"
+         "cfe0e9022100fc459ae4f59b8279d679003b88935896acd10021b6e2e4619377"
+         "e336b5296c5e014104c00bab76a708ba7064b2315420a1c533ca9945eeff9754"
+         "cdc574224589e9113469b4e71752146a10028079e04948ecdf70609bf1b9801f"
+         "6b73ab75947ac339e5ffffffff"
+         // NumTxOut
+         "02"
+         // ... TxOuts fragged out 
+         // Locktime
+         "00000000");
+
+      rawTxOut0_ = READHEX(
+         // Value
+         "ac4c8bd500000000"
+         // Script size (var_int)
+         "19"
+         // Script
+         "76""a9""14""8dce8946f1c7763bb60ea5cf16ef514cbed0633b""88""ac");
+      rawTxOut1_ = READHEX(
+         // Value 
+         "002f685900000000"
+         // Script size (var_int)
+         "19"
+         // Script
+         "76""a9""14""6a59ac0e8f553f292dfe5e9f3aaa1da93499c15e""88""ac");
+
+      bh_.unserialize(rawHead_);
+      tx1_.unserialize(rawTx0_);
+      tx2_.unserialize(rawTx1_);
+      sbh_.setHeaderData(rawHead_);
+
+      LOGDISABLESTDOUT();
+   }
+
+   /////
+   virtual void TearDown(void)
+   {
+      // This seem to be the best way to remove a dir tree in C++ (in Linux)
+      delete dbTx;
+      iface_->closeDatabases();
+      delete iface_;
+      iface_ = NULL;
+
+#ifdef _MSC_VER
+      rmdir("./ldbtestdir/*");
+#else
+      system("rm -rf ./ldbtestdir/*");
+#endif
+
+      CLEANUP_ALL_TIMERS();
+   }
+
+   /////
+   void addOutPairH(BinaryData key, BinaryData val)
+   {
+      expectOutH_.push_back(pair<BinaryData, BinaryData>(key, val));
+   }
+
+   /////
+   void addOutPairB(BinaryData key, BinaryData val)
+   {
+      expectOutB_.push_back(pair<BinaryData, BinaryData>(key, val));
+   }
+
+   /////
+   void replaceTopOutPairB(BinaryData key, BinaryData val)
+   {
+      uint32_t last = expectOutB_.size() - 1;
+      expectOutB_[last] = pair<BinaryData, BinaryData>(key, val);
+   }
+
+   /////
+   void printOutPairs(void)
+   {
+      cout << "Num Houts: " << expectOutH_.size() << endl;
+      for (uint32_t i = 0; i<expectOutH_.size(); i++)
+      {
+         cout << "   \"" << expectOutH_[i].first.toHexStr() << "\"  ";
+         cout << "   \"" << expectOutH_[i].second.toHexStr() << "\"    " << endl;
+      }
+      cout << "Num Bouts: " << expectOutB_.size() << endl;
+      for (uint32_t i = 0; i<expectOutB_.size(); i++)
+      {
+         cout << "   \"" << expectOutB_[i].first.toHexStr() << "\"  ";
+         cout << "   \"" << expectOutB_[i].second.toHexStr() << "\"    " << endl;
+      }
+   }
+
+   /////
+   bool compareKVListRange(uint32_t startH, uint32_t endplus1H,
+      uint32_t startB, uint32_t endplus1B)
+   {
+      KVLIST fromDB = iface_->getAllDatabaseEntries(HEADERS);
+
+      if (fromDB.size() < endplus1H || expectOutH_.size() < endplus1H)
+      {
+         LOGERR << "Headers DB not the correct size";
+         LOGERR << "DB  size:  " << (int)fromDB.size();
+         LOGERR << "Expected:  " << (int)expectOutH_.size();
+         return false;
+      }
+
+      for (uint32_t i = startH; i<endplus1H; i++)
+      if (fromDB[i].first != expectOutH_[i].first ||
+         fromDB[i].second != expectOutH_[i].second)
+      {
+         LOGERR << "Mismatch of DB keys/values: " << i;
+         LOGERR << "KEYS: ";
+         LOGERR << "   Database:   " << fromDB[i].first.toHexStr();
+         LOGERR << "   Expected:   " << expectOutH_[i].first.toHexStr();
+         LOGERR << "VALUES: ";
+         LOGERR << "   Database:   " << fromDB[i].second.toHexStr();
+         LOGERR << "   Expected:   " << expectOutH_[i].second.toHexStr();
+         return false;
+      }
+
+      fromDB = iface_->getAllDatabaseEntries(BLKDATA);
+      if (fromDB.size() < endplus1B || expectOutB_.size() < endplus1B)
+      {
+         LOGERR << "BLKDATA DB not the correct size";
+         LOGERR << "DB  size:  " << (int)fromDB.size();
+         LOGERR << "Expected:  " << (int)expectOutB_.size();
+         return false;
+      }
+
+      for (uint32_t i = startB; i<endplus1B; i++)
+      if (fromDB[i].first != expectOutB_[i].first ||
+         fromDB[i].second != expectOutB_[i].second)
+      {
+         LOGERR << "Mismatch of DB keys/values: " << i;
+         LOGERR << "KEYS: ";
+         LOGERR << "   Database:   " << fromDB[i].first.toHexStr();
+         LOGERR << "   Expected:   " << expectOutB_[i].first.toHexStr();
+         LOGERR << "VALUES: ";
+         LOGERR << "   Database:   " << fromDB[i].second.toHexStr();
+         LOGERR << "   Expected:   " << expectOutB_[i].second.toHexStr();
+         return false;
+      }
+
+      return true;
+   }
+
+
+   /////
+   bool standardOpenDBs(void)
+   {
+      iface_->openDatabases(
+         config_.levelDBLocation,
+         config_.genesisBlockHash,
+         config_.genesisTxHash,
+         config_.magicBytes,
+         config_.armoryDbType,
+         config_.pruneType);
+
+      dbTx = new LMDBEnv::Transaction(iface_->dbEnv_[BLKDATA].get(), LMDB::ReadWrite);
+
+      BinaryData DBINFO = StoredDBInfo().getDBKey();
+      BinaryData flags = READHEX("04100000");
+      BinaryData val0 = magic_ + flags + zeros_ + zeros_ + ghash_;
+      addOutPairH(DBINFO, val0);
+      addOutPairB(DBINFO, val0);
+
+      return iface_->databasesAreOpen();
+   }
+
+
+   LMDBBlockDatabase* iface_;
+   BlockDataManagerConfig config_;
+   LMDBEnv::Transaction* dbTx = nullptr;
+   vector<pair<BinaryData, BinaryData> > expectOutH_;
+   vector<pair<BinaryData, BinaryData> > expectOutB_;
+
+   BinaryData magic_;
+   BinaryData ghash_;
+   BinaryData gentx_;
+   BinaryData zeros_;
+
+   BinaryData rawHead_;
+   BinaryData headHashLE_;
+   BinaryData headHashBE_;
+   BinaryData rawBlock_;
+   BinaryData rawTx0_;
+   BinaryData rawTx1_;
+   BlockHeader bh_;
+   Tx tx1_;
+   Tx tx2_;
+   StoredHeader sbh_;
+   BinaryData rawTxUnfrag_;
+   BinaryData rawTxFragged_;
+   BinaryData rawTxOut0_;
+   BinaryData rawTxOut1_;
+
+};
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, OpenClose)
+{
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   ASSERT_TRUE(iface_->databasesAreOpen());
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 0);
+   EXPECT_EQ(READHEX(MAINNET_GENESIS_HASH_HEX), iface_->getTopBlockHash(HEADERS));
+
+   KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
+   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
+
+   // 0123 4567 0123 4567
+   // 0000 0010 0001 ---- ---- ---- ---- ----
+   BinaryData flags = READHEX("04100000");
+
+   for (uint32_t i = 0; i<HList.size(); i++)
+   {
+      EXPECT_EQ(HList[i].first, READHEX("00"));
+      EXPECT_EQ(BList[i].second, magic_ + flags + zeros_ + zeros_ + ghash_);
+   }
+
+   for (uint32_t i = 0; i<BList.size(); i++)
+   {
+      EXPECT_EQ(HList[i].first, READHEX("00"));
+      EXPECT_EQ(BList[i].second, magic_ + flags + zeros_ + zeros_ + ghash_);
+   }
+
+   iface_->closeDatabases();
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, OpenCloseOpenNominal)
+{
+   // 0123 4567 0123 4567
+   // 0000 0010 0001 ---- ---- ---- ---- ----
+   BinaryData flags = READHEX("04100000");
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+
+   iface_->closeDatabases();
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   ASSERT_TRUE(iface_->databasesAreOpen());
+
+   KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
+   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
+
+   for (uint32_t i = 0; i<HList.size(); i++)
+   {
+      EXPECT_EQ(HList[i].first, READHEX("00"));
+      EXPECT_EQ(BList[i].second, magic_ + flags + zeros_ + zeros_ + ghash_);
+   }
+
+   for (uint32_t i = 0; i<BList.size(); i++)
+   {
+      EXPECT_EQ(HList[i].first, READHEX("00"));
+      EXPECT_EQ(BList[i].second, magic_ + flags + zeros_ + zeros_ + ghash_);
+   }
+
+   iface_->closeDatabases();
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, DISABLED_OpenCloseOpenMismatch)
+{
+   LOGERR << "Expecting four error messages here:  this is normal";
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   EXPECT_TRUE(iface_->databasesAreOpen());
+   iface_->closeDatabases();
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   EXPECT_TRUE(iface_->databasesAreOpen());
+   iface_->closeDatabases();
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   EXPECT_FALSE(iface_->databasesAreOpen());
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   EXPECT_FALSE(iface_->databasesAreOpen());
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   ASSERT_TRUE(iface_->databasesAreOpen());
+
+   KVLIST HList = iface_->getAllDatabaseEntries(HEADERS);
+   KVLIST BList = iface_->getAllDatabaseEntries(BLKDATA);
+
+   EXPECT_EQ(HList.begin()->first, READHEX("00"));
+   EXPECT_EQ(BList.begin()->first, READHEX("00"));
+
+   iface_->closeDatabases();
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutGetDelete)
+{
+   BinaryData flags = READHEX("04100000");
+
+   iface_->openDatabases(
+      config_.levelDBLocation,
+      config_.genesisBlockHash,
+      config_.genesisTxHash,
+      config_.magicBytes,
+      config_.armoryDbType,
+      config_.pruneType);
+
+   ASSERT_TRUE(iface_->databasesAreOpen());
+   LMDBEnv::Transaction tx(iface_->dbEnv_[BLKDATA].get(), LMDB::ReadWrite);
+
+   DB_PREFIX TXDATA = DB_PREFIX_TXDATA;
+   BinaryData DBINFO = StoredDBInfo().getDBKey();
+   BinaryData PREFIX = WRITE_UINT8_BE((uint8_t)TXDATA);
+   BinaryData val0 = magic_ + flags + zeros_ + zeros_ + ghash_;
+   BinaryData commonValue = READHEX("abcd1234");
+   BinaryData keyAB = READHEX("0000");
+   BinaryData nothing = BinaryData(0);
+
+   addOutPairH(DBINFO, val0);
+
+   addOutPairB(DBINFO, val0);
+   addOutPairB(keyAB, commonValue);
+   addOutPairB(PREFIX + keyAB, commonValue);
+
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 1));
+
+   iface_->putValue(BLKDATA, keyAB, commonValue);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 2));
+
+   iface_->putValue(BLKDATA, DB_PREFIX_TXDATA, keyAB, commonValue);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 3));
+
+   // Now test a bunch of get* methods
+   ASSERT_EQ(iface_->getValue(BLKDATA, PREFIX + keyAB), commonValue);
+   ASSERT_EQ(iface_->getValue(BLKDATA, DB_PREFIX_DBINFO, nothing), val0);
+   ASSERT_EQ(iface_->getValue(BLKDATA, DBINFO), val0);
+   ASSERT_EQ(iface_->getValueRef(BLKDATA, PREFIX + keyAB), commonValue);
+   ASSERT_EQ(iface_->getValueRef(BLKDATA, TXDATA, keyAB), commonValue);
+   ASSERT_EQ(iface_->getValueReader(BLKDATA, PREFIX + keyAB).getRawRef(), commonValue);
+   ASSERT_EQ(iface_->getValueReader(BLKDATA, TXDATA, keyAB).getRawRef(), commonValue);
+
+   iface_->deleteValue(BLKDATA, DB_PREFIX_TXDATA, keyAB);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 2));
+
+   iface_->deleteValue(BLKDATA, PREFIX + keyAB);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 1));
+
+   iface_->deleteValue(BLKDATA, PREFIX + keyAB);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, STxOutPutGet)
+{
+   BinaryData TXP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
+   BinaryData stxoVal = READHEX("0400") + rawTxOut0_;
+   BinaryData stxoKey = TXP + READHEX("01e078""0f""0007""0001");
+
+   ASSERT_TRUE(standardOpenDBs());
+
+   StoredTxOut stxo0;
+   stxo0.txVersion_ = 1;
+   stxo0.spentness_ = TXOUT_UNSPENT;
+   stxo0.blockHeight_ = 123000;
+   stxo0.duplicateID_ = 15;
+   stxo0.txIndex_ = 7;
+   stxo0.txOutIndex_ = 1;
+   stxo0.unserialize(rawTxOut0_);
+   iface_->putStoredTxOut(stxo0);
+
+   // Construct expected output
+   addOutPairB(stxoKey, stxoVal);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 2));
+
+   StoredTxOut stxoGet;
+   iface_->getStoredTxOut(stxoGet, 123000, 15, 7, 1);
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE)
+      );
+
+   //iface_->validDupByHeight_[123000] = 15;
+   //iface_->getStoredTxOut(stxoGet, 123000, 7, 1);
+   //EXPECT_EQ(serializeDBValue(stxoGet), serializeDBValue(stxo0));
+
+   StoredTxOut stxo1;
+   stxo1.txVersion_ = 1;
+   stxo1.spentness_ = TXOUT_UNSPENT;
+   stxo1.blockHeight_ = 200333;
+   stxo1.duplicateID_ = 3;
+   stxo1.txIndex_ = 7;
+   stxo1.txOutIndex_ = 1;
+   stxo1.unserialize(rawTxOut1_);
+   stxoVal = READHEX("0400") + rawTxOut1_;
+   stxoKey = TXP + READHEX("030e8d""03""00070001");
+   iface_->putStoredTxOut(stxo1);
+
+   iface_->getStoredTxOut(stxoGet, 123000, 15, 7, 1);
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo0, ARMORY_DB_FULL, DB_PRUNE_NONE)
+      );
+   iface_->getStoredTxOut(stxoGet, 200333, 3, 7, 1);
+   EXPECT_EQ(
+      serializeDBValue(stxoGet, ARMORY_DB_FULL, DB_PRUNE_NONE),
+      serializeDBValue(stxo1, ARMORY_DB_FULL, DB_PRUNE_NONE)
+      );
+
+   addOutPairB(stxoKey, stxoVal);
+   ASSERT_TRUE(compareKVListRange(0, 1, 0, 3));
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutFullTxNoOuts)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+   ASSERT_TRUE(standardOpenDBs());
+
+   StoredTx stx;
+   stx.createFromTx(rawTxUnfrag_);
+   stx.setKeyData(123000, 15, 7);
+
+   BinaryData TXP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
+   BinaryData stxKey = TXP + READHEX("01e078""0f""0007");
+   BinaryData stxVal = READHEX("0440") + stx.thisHash_ + rawTxFragged_;
+
+   iface_->putStoredTx(stx, false);
+   addOutPairB(stxKey, stxVal);
+   EXPECT_TRUE(compareKVListRange(0, 1, 0, 2));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutFullTx)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+   BinaryData TXP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
+   BinaryData stxoVal = READHEX("0400") + rawTxOut0_;
+   BinaryData stxKey = TXP + READHEX("01e078""0f""0007");
+   BinaryData stxo0Key = TXP + READHEX("01e078""0f""0007""0000");
+   BinaryData stxo1Key = TXP + READHEX("01e078""0f""0007""0001");
+   BinaryData stxo0raw = READHEX(
+      "ac4c8bd5000000001976a9148dce8946f1c7763bb60ea5cf16ef514cbed0633b88ac");
+   BinaryData stxo1raw = READHEX(
+      "002f6859000000001976a9146a59ac0e8f553f292dfe5e9f3aaa1da93499c15e88ac");
+
+   ASSERT_TRUE(standardOpenDBs());
+
+   StoredTx stx;
+   stx.createFromTx(rawTxUnfrag_);
+   stx.setKeyData(123000, 15, 7);
+
+   ASSERT_EQ(stx.stxoMap_.size(), 2);
+   for (uint32_t i = 0; i<2; i++)
+   {
+      stx.stxoMap_[i].spentness_ = TXOUT_UNSPENT;
+      stx.stxoMap_[i].isCoinbase_ = false;
+
+      ASSERT_EQ(stx.stxoMap_[i].blockHeight_, 123000);
+      ASSERT_EQ(stx.stxoMap_[i].duplicateID_, 15);
+      ASSERT_EQ(stx.stxoMap_[i].txIndex_, 7);
+      ASSERT_EQ(stx.stxoMap_[i].txOutIndex_, i);
+      ASSERT_EQ(stx.stxoMap_[i].isCoinbase_, false);
+   }
+
+   BinaryData stxVal = READHEX("0440") + stx.thisHash_ + rawTxFragged_;
+   BinaryData stxo0Val = READHEX("0400") + stxo0raw;
+   BinaryData stxo1Val = READHEX("0400") + stxo1raw;
+
+   iface_->putStoredTx(stx);
+   addOutPairB(stxKey, stxVal);
+   addOutPairB(stxo0Key, stxo0Val);
+   addOutPairB(stxo1Key, stxo1Val);
+   EXPECT_TRUE(compareKVListRange(0, 1, 0, 4));
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutFullBlockNoTx)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+   StoredHeader sbh;
+   BinaryRefReader brr(rawBlock_);
+   sbh.unserializeFullBlock(brr);
+   sbh.setKeyData(123000, UINT8_MAX);
+
+   StoredHeadHgtList hhl;
+   hhl.height_ = 123000;
+   hhl.dupAndHashList_.push_back(pair<uint8_t, BinaryData>(0, sbh.thisHash_));
+   hhl.preferredDup_ = UINT8_MAX;
+
+   BinaryData TXP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
+   BinaryData HHP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHASH);
+   BinaryData HGP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHGT);
+   BinaryData hgtx = READHEX("01e078""00");
+   BinaryData sbh_HH_key = HHP + sbh.thisHash_;
+   BinaryData sbh_HH_val = sbh.dataCopy_ + hgtx + READHEX("46040000");
+   BinaryData sbh_HG_key = hhl.getDBKey();
+   BinaryData sbh_HG_val = hhl.serializeDBValue();
+
+   ASSERT_TRUE(standardOpenDBs());
+
+   addOutPairH(sbh_HH_key, sbh_HH_val);
+   addOutPairH(sbh_HG_key, sbh_HG_val);
+
+   uint8_t sdup = iface_->putStoredHeader(sbh, false);
+   EXPECT_TRUE(compareKVListRange(0, 3, 0, 1));
+   EXPECT_EQ(sdup, 0);
+
+   // Try adding it again and see if get the correct dup again, and no touch DB
+   sdup = iface_->putStoredHeader(sbh, false);
+   EXPECT_TRUE(compareKVListRange(0, 3, 0, 1));
+   EXPECT_EQ(sdup, 0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutGetBareHeader)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+   StoredHeader sbh;
+   BinaryRefReader brr(rawBlock_);
+   sbh.unserializeFullBlock(brr);
+   sbh.setKeyData(123000, UINT8_MAX);
+   BinaryData header0 = sbh.thisHash_;
+
+   ASSERT_TRUE(standardOpenDBs());
+
+   uint8_t sdup = iface_->putBareHeader(sbh);
+   EXPECT_EQ(sdup, 0);
+   EXPECT_EQ(sbh.duplicateID_, 0);
+
+   // Add a new header and make sure duplicate ID is done correctly
+   BinaryData newHeader = READHEX(
+      "0000000105d3571220ef5f87c6ac0bc8bf5b33c02a9e6edf83c84d840109592c"
+      "0000000027523728e15f5fe1ac507bff92499eada4af8a0c485d5178e3f96568"
+      "c18f84994e0e4efc1c0175d646a91ad4");
+   BinaryData header1 = BtcUtils::getHash256(newHeader);
+
+   StoredHeader sbh2;
+   sbh2.setHeaderData(newHeader);
+   sbh2.setKeyData(123000, UINT8_MAX);
+
+   uint8_t newDup = iface_->putBareHeader(sbh2);
+   EXPECT_EQ(newDup, 1);
+   EXPECT_EQ(sbh2.duplicateID_, 1);
+
+   // Now add a new, isMainBranch_ header
+   StoredHeader sbh3;
+   BinaryData anotherHead = READHEX(
+      "010000001d8f4ec0443e1f19f305e488c1085c95de7cc3fd25e0d2c5bb5d0000"
+      "000000009762547903d36881a86751f3f5049e23050113f779735ef82734ebf0"
+      "b4450081d8c8c84db3936a1a334b035b");
+   BinaryData header2 = BtcUtils::getHash256(anotherHead);
+
+   sbh3.setHeaderData(anotherHead);
+   sbh3.setKeyData(123000, UINT8_MAX);
+   sbh3.isMainBranch_ = true;
+   uint8_t anotherDup = iface_->putBareHeader(sbh3);
+   EXPECT_EQ(anotherDup, 2);
+   EXPECT_EQ(sbh3.duplicateID_, 2);
+   EXPECT_EQ(iface_->getValidDupIDForHeight(123000), 2);
+
+   // Now test getting bare headers
+   StoredHeader sbh4;
+   iface_->getBareHeader(sbh4, 123000);
+   EXPECT_EQ(sbh4.thisHash_, header2);
+   EXPECT_EQ(sbh4.duplicateID_, 2);
+
+   iface_->getBareHeader(sbh4, 123000, 1);
+   EXPECT_EQ(sbh4.thisHash_, header1);
+   EXPECT_EQ(sbh4.duplicateID_, 1);
+
+   // Re-add the same SBH3, make sure nothing changes
+   iface_->putBareHeader(sbh3);
+   EXPECT_EQ(sbh3.duplicateID_, 2);
+   EXPECT_EQ(iface_->getValidDupIDForHeight(123000), 2);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutFullBlock)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+   ASSERT_TRUE(standardOpenDBs());
+
+   StoredHeader sbh;
+   BinaryRefReader brr(rawBlock_);
+   sbh.unserializeFullBlock(brr);
+   sbh.setKeyData(123000);
+
+   BinaryData rawHeader = READHEX(
+      "01000000eb10c9a996a2340a4d74eaab41421ed8664aa49d18538bab59010000"
+      "000000005a2f06efa9f2bd804f17877537f2080030cadbfa1eb50e02338117cc"
+      "604d91b9b7541a4ecfbb0a1a64f1ade7");
+
+   // Compute and write the headers to the expected-output
+   StoredHeadHgtList hhl;
+   hhl.height_ = 123000;
+   hhl.dupAndHashList_.push_back(pair<uint8_t, BinaryData>(0, sbh.thisHash_));
+   hhl.preferredDup_ = UINT8_MAX;
+   BinaryData HHP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHASH);
+   BinaryData HGP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_HEADHGT);
+   BinaryData sbh_HH_key = HHP + sbh.thisHash_;
+   BinaryData sbh_HH_val = rawHeader + READHEX("01e078""00") + READHEX("46040000");
+   BinaryData sbh_HG_key = hhl.getDBKey();
+   BinaryData sbh_HG_val = hhl.serializeDBValue();
+   // Only HEADHASH and HEADHGT entries get written
+   addOutPairH(sbh_HH_key, sbh_HH_val);
+   addOutPairH(sbh_HG_key, sbh_HG_val);
+
+   // Now compute and write the BLKDATA
+   BinaryData TXP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXDATA);
+   BinaryData sbhKey = TXP + READHEX("01e078""00");
+   BinaryData stx0Key = sbhKey + READHEX("0000");
+   BinaryData stx1Key = sbhKey + READHEX("0001");
+   BinaryData stx2Key = sbhKey + READHEX("0002");
+   BinaryData stxo00Key = stx0Key + READHEX("0000");
+   BinaryData stxo10Key = stx1Key + READHEX("0000");
+   BinaryData stxo11Key = stx1Key + READHEX("0001");
+   BinaryData stxo20Key = stx2Key + READHEX("0000");
+   BinaryData stxo21Key = stx2Key + READHEX("0001");
+   BinaryData stxo00Raw = READHEX("00f2052a01000000""434104"
+      "c2239c4eedb3beb26785753463be3ec62b82f6acd62efb65f452f8806f2ede0b"
+      "338e31d1f69b1ce449558d7061aa1648ddc2bf680834d3986624006a272dc21cac");
+   BinaryData stxo10Raw = READHEX("40420f0000000000"
+      "19""76a914adfa66f57ded1b655eb4ccd96ee07ca62bc1ddfd88ac");
+   BinaryData stxo11Raw = READHEX("007d6a7d04000000"
+      "19""76a914981a0c9ae61fa8f8c96ae6f8e383d6e07e77133e88ac");
+   BinaryData stxo20Raw = READHEX("2f66ac6105000000"
+      "19""76a914964642290c194e3bfab661c1085e47d67786d2d388ac");
+   BinaryData stxo21Raw = READHEX("2f77e20000000000"
+      "19""76a9141486a7046affd935919a3cb4b50a8a0c233c286c88ac");
+
+   StoredTx & stx0 = sbh.stxMap_[0];
+   StoredTx & stx1 = sbh.stxMap_[1];
+   StoredTx & stx2 = sbh.stxMap_[2];
+   BinaryData hflags = READHEX("01440000");
+   BinaryData ntx = READHEX("03000000");
+   BinaryData nbyte = READHEX("46040000");
+
+   // Add header to BLKDATA
+   addOutPairB(sbhKey, hflags + rawHeader + ntx + nbyte);
+
+   // Add Tx0 to BLKDATA
+   addOutPairB(stx0Key, READHEX("0440") + stx0.thisHash_ + stx0.getSerializedTxFragged());
+   addOutPairB(stxo00Key, READHEX("0480") + stxo00Raw); // is coinbase
+
+   // Add Tx1 to BLKDATA
+   addOutPairB(stx1Key, READHEX("0440") + stx1.thisHash_ + stx1.getSerializedTxFragged());
+   addOutPairB(stxo10Key, READHEX("0400") + stxo10Raw);
+   addOutPairB(stxo11Key, READHEX("0400") + stxo11Raw);
+
+   // Add Tx2 to BLKDATA
+   addOutPairB(stx2Key, READHEX("0440") + stx2.thisHash_ + stx2.getSerializedTxFragged());
+   addOutPairB(stxo20Key, READHEX("0400") + stxo20Raw);
+   addOutPairB(stxo21Key, READHEX("0400") + stxo21Raw);
+
+   // DuplicateID values get set when we putStoredHeader since we don't know
+   // what dupIDs have been taken until we try to put it in the database.
+   ASSERT_EQ(sbh.stxMap_.size(), 3);
+   for (uint32_t i = 0; i<3; i++)
+   {
+      ASSERT_EQ(sbh.stxMap_[i].blockHeight_, 123000);
+      ASSERT_EQ(sbh.stxMap_[i].duplicateID_, UINT8_MAX);
+      ASSERT_EQ(sbh.stxMap_[i].txIndex_, i);
+      for (uint32_t j = 0; j<sbh.stxMap_[i].stxoMap_.size(); j++)
+      {
+         sbh.stxMap_[i].stxoMap_[j].spentness_ = TXOUT_UNSPENT;
+         //sbh.stxoMap_[i].isCoinbase_ = (j==0);
+
+         ASSERT_EQ(sbh.stxMap_[i].stxoMap_[j].blockHeight_, 123000);
+         ASSERT_EQ(sbh.stxMap_[i].stxoMap_[j].duplicateID_, UINT8_MAX);
+         ASSERT_EQ(sbh.stxMap_[i].stxoMap_[j].txIndex_, i);
+         ASSERT_EQ(sbh.stxMap_[i].stxoMap_[j].txOutIndex_, j);
+      }
+   }
+
+   iface_->putStoredHeader(sbh);
+
+   ASSERT_TRUE(compareKVListRange(0, 3, 0, 9));
+}
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Of course, this test only works if the previous test passes (but doesn't 
+// require a saved state, it just re-puts the full block into the DB).  I
+// did it this way, because I wasn't comfortable committing the pre-filled
+// DB to the repo.
+TEST_F(LMDBTest_Super, GetFullBlock)
+{
+   //    DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+   //    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+   ASSERT_TRUE(standardOpenDBs());
+
+   StoredHeader sbh;
+   BinaryRefReader brr(rawBlock_);
+   sbh.unserializeFullBlock(brr);
+   sbh.setKeyData(123000);
+   sbh.isMainBranch_ = true;
+
+   // Check the DBInfo before and after putting the valid header
+   StoredDBInfo sdbi;
+   iface_->getStoredDBInfo(HEADERS, sdbi);
+   EXPECT_EQ(sdbi.topBlkHgt_, 0);
+   EXPECT_EQ(sdbi.topBlkHash_, iface_->getGenesisBlockHash());
+
+   iface_->putStoredHeader(sbh);
+
+   // Since we marked this block main-branch, it should have non-MAX validDup
+   EXPECT_EQ(iface_->getValidDupIDForHeight(123000), 0);
+   BinaryData headerHash = READHEX(
+      "7d97d862654e03d6c43b77820a40df894e3d6890784528e9cd05000000000000");
+   iface_->getStoredDBInfo(HEADERS, sdbi);
+   EXPECT_EQ(sdbi.topBlkHgt_, 123000);
+   EXPECT_EQ(sdbi.topBlkHash_, headerHash);
+
+   BinaryData rawHeader = READHEX(
+      "01000000eb10c9a996a2340a4d74eaab41421ed8664aa49d18538bab59010000"
+      "000000005a2f06efa9f2bd804f17877537f2080030cadbfa1eb50e02338117cc"
+      "604d91b9b7541a4ecfbb0a1a64f1ade7");
+
+   ////////////////////
+   // Now test the get methods
+
+   for (uint32_t i = 0; i<4; i++)
+   {
+      StoredHeader sbhGet;
+
+      if (i == 0)
+         EXPECT_TRUE(iface_->getStoredHeader(sbhGet, 123000, 0, false));
+      else if (i == 1)
+         EXPECT_TRUE(iface_->getStoredHeader(sbhGet, headerHash, false));
+      else if (i == 2)
+         EXPECT_TRUE(iface_->getStoredHeader(sbhGet, 123000, 0, true));
+      else if (i == 3)
+         EXPECT_TRUE(iface_->getStoredHeader(sbhGet, headerHash, true));
+
+      EXPECT_TRUE(sbhGet.isInitialized());
+      EXPECT_EQ(sbhGet.dataCopy_, rawHeader);
+      EXPECT_EQ(sbhGet.thisHash_, headerHash);
+      EXPECT_EQ(sbhGet.numTx_, 3);
+      EXPECT_EQ(sbhGet.numBytes_, 1094);
+      EXPECT_EQ(sbhGet.blockHeight_, 123000);
+      EXPECT_EQ(sbhGet.duplicateID_, 0);
+      EXPECT_EQ(sbhGet.merkle_.getSize(), 0);
+      EXPECT_FALSE(sbhGet.merkleIsPartial_);
+      EXPECT_EQ(sbhGet.unserArmVer_, 0);
+      EXPECT_EQ(sbhGet.unserBlkVer_, 1);
+      EXPECT_EQ(sbhGet.unserDbType_, ARMORY_DB_SUPER);
+      EXPECT_EQ(sbhGet.unserPrType_, DB_PRUNE_NONE);
+
+      if (i<2)
+         EXPECT_EQ(sbhGet.stxMap_.size(), 0);
+      else
+      {
+         EXPECT_EQ(sbhGet.stxMap_.size(), 3);
+         EXPECT_EQ(sbhGet.stxMap_[1].blockHeight_, 123000);
+         EXPECT_EQ(sbhGet.stxMap_[1].duplicateID_, 0);
+         EXPECT_EQ(sbhGet.stxMap_[1].txIndex_, 1);
+         EXPECT_EQ(sbhGet.stxMap_[1].numTxOut_, 2);
+         EXPECT_EQ(sbhGet.stxMap_[1].numBytes_, 621);
+         EXPECT_EQ(sbhGet.stxMap_[0].stxoMap_[0].isCoinbase_, true);
+         EXPECT_EQ(sbhGet.stxMap_[0].stxoMap_[0].spentness_, TXOUT_SPENTUNK);
+         EXPECT_EQ(sbhGet.stxMap_[1].stxoMap_[0].isCoinbase_, false);
+         EXPECT_EQ(sbhGet.stxMap_[1].stxoMap_[0].blockHeight_, 123000);
+         EXPECT_EQ(sbhGet.stxMap_[1].stxoMap_[0].duplicateID_, 0);
+         EXPECT_EQ(sbhGet.stxMap_[1].stxoMap_[0].txIndex_, 1);
+         EXPECT_EQ(sbhGet.stxMap_[1].stxoMap_[0].txOutIndex_, 0);
+      }
+   }
+
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutGetStoredTxHints)
+{
+   ASSERT_TRUE(standardOpenDBs());
+
+   BinaryData prefix = READHEX("aabbccdd");
+
+   StoredTxHints sths;
+   EXPECT_FALSE(iface_->getStoredTxHints(sths, prefix));
+
+   sths.txHashPrefix_ = prefix;
+
+   ASSERT_TRUE(iface_->putStoredTxHints(sths));
+
+   BinaryData THP = WRITE_UINT8_BE((uint8_t)DB_PREFIX_TXHINTS);
+   addOutPairB(THP + prefix, READHEX("00"));
+
+   compareKVListRange(0, 1, 0, 2);
+
+   /////
+   sths.dbKeyList_.push_back(READHEX("abcd1234ffff"));
+   replaceTopOutPairB(THP + prefix, READHEX("01""abcd1234ffff"));
+   EXPECT_TRUE(iface_->putStoredTxHints(sths));
+   compareKVListRange(0, 1, 0, 2);
+
+   /////
+   sths.dbKeyList_.push_back(READHEX("00002222aaaa"));
+   replaceTopOutPairB(THP + prefix, READHEX("02""abcd1234ffff""00002222aaaa"));
+   EXPECT_TRUE(iface_->putStoredTxHints(sths));
+   compareKVListRange(0, 1, 0, 2);
+
+   /////
+   sths.preferredDBKey_ = READHEX("00002222aaaa");
+   replaceTopOutPairB(THP + prefix, READHEX("02""00002222aaaa""abcd1234ffff"));
+   EXPECT_TRUE(iface_->putStoredTxHints(sths));
+   compareKVListRange(0, 1, 0, 2);
+
+   // Now test the get methods
+   EXPECT_TRUE(iface_->getStoredTxHints(sths, prefix));
+   EXPECT_EQ(sths.txHashPrefix_, prefix);
+   EXPECT_EQ(sths.dbKeyList_.size(), 2);
+   EXPECT_EQ(sths.preferredDBKey_, READHEX("00002222aaaa"));
+
+   //
+   sths.dbKeyList_.resize(0);
+   sths.preferredDBKey_.resize(0);
+   EXPECT_TRUE(iface_->putStoredTxHints(sths));
+   EXPECT_TRUE(iface_->getStoredTxHints(sths, prefix));
+   EXPECT_EQ(sths.txHashPrefix_, prefix);
+   EXPECT_EQ(sths.dbKeyList_.size(), 0);
+   EXPECT_EQ(sths.preferredDBKey_.getSize(), 0);
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(LMDBTest_Super, PutGetStoredScriptHistory)
+{
+   ASSERT_TRUE(standardOpenDBs());
+
+   ///////////////////////////////////////////////////////////////////////////
+   // A whole bunch of setup stuff we need for SSH operations to work right
+   LMDBBlockDatabase *const iface = iface_;
+   iface->setValidDupIDForHeight(255, 0);
+   iface->setValidDupIDForHeight(256, 0);
+
+   BinaryData dbkey0 = READHEX("0000ff00""0001""0001");
+   BinaryData dbkey1 = READHEX("0000ff00""0002""0002");
+   BinaryData dbkey2 = READHEX("00010000""0004""0004");
+   BinaryData dbkey3 = READHEX("00010000""0006""0006");
+   uint64_t   val0 = READ_UINT64_HEX_LE("0100000000000000");
+   uint64_t   val1 = READ_UINT64_HEX_LE("0002000000000000");
+   uint64_t   val2 = READ_UINT64_HEX_LE("0000030000000000");
+   uint64_t   val3 = READ_UINT64_HEX_LE("0000000400000000");
+
+   BinaryData PREFIX = READHEX("03");
+   BinaryData RAWTX = READHEX(
+      "01000000016290dce984203b6a5032e543e9e272d8bce934c7de4d15fa0fe44d"
+      "d49ae4ece9010000008b48304502204f2fa458d439f957308bca264689aa175e"
+      "3b7c5f78a901cb450ebd20936b2c500221008ea3883a5b80128e55c9c6070aa6"
+      "264e1e0ce3d18b7cd7e85108ce3d18b7419a0141044202550a5a6d3bb81549c4"
+      "a7803b1ad59cdbba4770439a4923624a8acfc7d34900beb54a24188f7f0a4068"
+      "9d905d4847cc7d6c8d808a457d833c2d44ef83f76bffffffff0242582c0a0000"
+      "00001976a914c1b4695d53b6ee57a28647ce63e45665df6762c288ac80d1f008"
+      "000000001976a9140e0aec36fe2545fb31a41164fb6954adcd96b34288ac0000"
+      "0000");
+   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey0, RAWTX);
+   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey1, RAWTX);
+   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey2, RAWTX);
+   iface->putValue(BLKDATA, DB_PREFIX_TXDATA, dbkey3, RAWTX);
+
+   TxIOPair txio0(dbkey0, val0);
+   TxIOPair txio1(dbkey1, val1);
+   TxIOPair txio2(dbkey2, val2);
+   TxIOPair txio3(dbkey3, val3);
+   txio3.setMultisig(true);
+   ///////////////////////////////////////////////////////////////////////////
+
+   StoredSubHistory * subptr;
+   TxIOPair * txioptr;
+
+   StoredScriptHistory ssh, sshorig, sshtemp;
+   BinaryData hgtX0 = READHEX("0000ff00");
+   BinaryData hgtX1 = READHEX("00010000");
+   BinaryData uniq = READHEX("00""0000ffff0000ffff0000ffff0000ffff0000ffff");
+   sshorig.uniqueKey_ = uniq;
+   uint32_t blk = READ_UINT32_HEX_LE("ffff0000");
+   sshorig.alreadyScannedUpToBlk_ = blk;
+   sshorig.version_ = 1;
+
+   /////////////////////////////////////////////////////////////////////////////
+   // Haven't actually done anything yet...
+   ssh = sshorig;
+   EXPECT_EQ(ssh.uniqueKey_, uniq);
+   EXPECT_EQ(ssh.alreadyScannedUpToBlk_, blk);
+   EXPECT_EQ(ssh.subHistMap_.size(), 0);
+
+   /////////////////////////////////////////////////////////////////////////////
+   // An empty SSH -- this shouldn't happen in production, but test it anyway
+   iface_->putStoredScriptHistory(ssh);
+   iface_->getStoredScriptHistory(sshtemp, uniq);
+
+   EXPECT_EQ(sshtemp.uniqueKey_, uniq);
+   EXPECT_EQ(sshtemp.alreadyScannedUpToBlk_, blk);
+   EXPECT_EQ(sshtemp.subHistMap_.size(), 0);
+
+   /////////////////////////////////////////////////////////////////////////////
+   // A single txio
+   ssh = sshorig;
+   ssh.insertTxio(txio0);
+
+   iface_->putStoredScriptHistory(ssh);
+   iface_->getStoredScriptHistory(sshtemp, uniq);
+
+   EXPECT_EQ(sshtemp.uniqueKey_, uniq);
+   EXPECT_EQ(sshtemp.alreadyScannedUpToBlk_, blk);
+   EXPECT_EQ(sshtemp.totalTxioCount_, 1);
+   EXPECT_EQ(sshtemp.totalUnspent_, val0);
+   EXPECT_EQ(sshtemp.subHistMap_.size(), 1);
+   ASSERT_NE(sshtemp.subHistMap_.find(hgtX0), sshtemp.subHistMap_.end());
+   subptr = &sshtemp.subHistMap_[hgtX0];
+   EXPECT_EQ(subptr->uniqueKey_, uniq);
+   EXPECT_EQ(subptr->hgtX_, hgtX0);
+   ASSERT_EQ(subptr->txioMap_.size(), 1);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
+   EXPECT_EQ(txioptr->getValue(), val0);
+   EXPECT_FALSE(txioptr->isMultisig());
+
+   /////////////////////////////////////////////////////////////////////////////
+   // Two TxIOPairs in one sub history
+   ssh = sshorig;
+   sshtemp = StoredScriptHistory();
+   ssh.insertTxio(txio0);
+   ssh.insertTxio(txio1);
+
+   iface_->putStoredScriptHistory(ssh);
+   iface_->getStoredScriptHistory(sshtemp, uniq);
+
+   EXPECT_EQ(sshtemp.uniqueKey_, uniq);
+   EXPECT_EQ(sshtemp.alreadyScannedUpToBlk_, blk);
+   EXPECT_EQ(sshtemp.totalTxioCount_, 2);
+   EXPECT_EQ(sshtemp.totalUnspent_, val0 + val1);
+   EXPECT_EQ(sshtemp.subHistMap_.size(), 1);
+   ASSERT_NE(sshtemp.subHistMap_.find(hgtX0), sshtemp.subHistMap_.end());
+   subptr = &sshtemp.subHistMap_[hgtX0];
+   EXPECT_EQ(subptr->uniqueKey_, uniq);
+   EXPECT_EQ(subptr->hgtX_, hgtX0);
+   ASSERT_EQ(subptr->txioMap_.size(), 2);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
+   EXPECT_EQ(txioptr->getValue(), val0);
+   EXPECT_FALSE(txioptr->isMultisig());
+   txioptr = &subptr->txioMap_[dbkey1];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey1);
+   EXPECT_EQ(txioptr->getValue(), val1);
+   EXPECT_FALSE(txioptr->isMultisig());
+
+
+   /////////////////////////////////////////////////////////////////////////////
+   // Add new sub-history with multisig
+   ssh = sshorig;
+   ssh.insertTxio(txio0);
+   ssh.insertTxio(txio1);
+   ssh.insertTxio(txio3);
+
+   iface_->putStoredScriptHistory(ssh);
+   iface_->getStoredScriptHistory(sshtemp, uniq);
+
+   EXPECT_EQ(sshtemp.uniqueKey_, uniq);
+   EXPECT_EQ(sshtemp.alreadyScannedUpToBlk_, blk);
+   EXPECT_EQ(sshtemp.totalTxioCount_, 3);
+   EXPECT_EQ(sshtemp.totalUnspent_, val0 + val1);
+   EXPECT_EQ(sshtemp.subHistMap_.size(), 2);
+
+   ASSERT_NE(sshtemp.subHistMap_.find(hgtX0), sshtemp.subHistMap_.end());
+   subptr = &sshtemp.subHistMap_[hgtX0];
+   EXPECT_EQ(subptr->uniqueKey_, uniq);
+   EXPECT_EQ(subptr->hgtX_, hgtX0);
+   ASSERT_EQ(subptr->txioMap_.size(), 2);
+   ASSERT_NE(subptr->txioMap_.find(dbkey0), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey0];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey0);
+   EXPECT_EQ(txioptr->getValue(), val0);
+   txioptr = &subptr->txioMap_[dbkey1];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey1);
+   EXPECT_EQ(txioptr->getValue(), val1);
+   EXPECT_FALSE(txioptr->isMultisig());
+
+   ASSERT_NE(sshtemp.subHistMap_.find(hgtX1), sshtemp.subHistMap_.end());
+   subptr = &sshtemp.subHistMap_[hgtX1];
+   EXPECT_EQ(subptr->uniqueKey_, uniq);
+   EXPECT_EQ(subptr->hgtX_, hgtX1);
+   ASSERT_EQ(subptr->txioMap_.size(), 1);
+   ASSERT_NE(subptr->txioMap_.find(dbkey3), subptr->txioMap_.end());
+   txioptr = &subptr->txioMap_[dbkey3];
+   EXPECT_EQ(txioptr->getDBKeyOfOutput(), dbkey3);
+   EXPECT_EQ(txioptr->getValue(), val3);
+   EXPECT_TRUE(txioptr->isMultisig());
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 class TxRefTest : public ::testing::Test
@@ -5823,102 +7234,115 @@ TEST_F(DISABLED_PartialMerkleTest, EmptyTree)
 class BlockUtilsBare : public ::testing::Test
 {
 protected:
+   BlockDataManager_LevelDB *theBDM;
+   BlockDataViewer *theBDV;
+
+   // Run this before registering a BDM.
+   void regWallet(const vector<BinaryData>& scrAddrs, const string& wltName,
+                  BlockDataViewer*& inBDV, BtcWallet** inWlt)
+   {
+      // Register the standalone address wallet. (All registrations should be
+      // done before initializing the BDM. This is critical!)
+      *inWlt = inBDV->registerWallet(scrAddrs, wltName, false);
+   }
+
+
+   // Run this before registering a BDM. (For now, just make the two lockboxes a
+   // package deal. Code can be altered later if needed.)
+   void regLockboxes(BlockDataViewer*& inBDV, BtcWallet** inLB1,
+                     BtcWallet** inLB2)
+   {
+      // Register the two lockboxes. Note that the lockbox data is pulled from
+      // createTestChain.py, the script that built most of the blocks used in
+      // these unit tests. Python, not C++, is where we find the code needed to
+      // generate the data required by C++ lockboxes. If the lockboxes and/or
+      // blocks are redone, this data's automatically redone.
+      // LB1 = AddrB + AddrC
+      // LB2 = AddrD + AddrE
+      const vector<BinaryData> lb1ScrAddrs
+      {
+         TestChain::lb1ScrAddr,
+         TestChain::lb1ScrAddrP2SH
+      };
+      const vector<BinaryData> lb2ScrAddrs
+      {
+         TestChain::lb2ScrAddr,
+         TestChain::lb2ScrAddrP2SH
+      };
+      *inLB1 = inBDV->registerLockbox(lb1ScrAddrs, TestChain::lb1B58ID, false);
+      *inLB2 = inBDV->registerLockbox(lb2ScrAddrs, TestChain::lb2B58ID, false);
+   }
+
 
    /////////////////////////////////////////////////////////////////////////////
-   virtual void SetUp(void) 
+   virtual void SetUp()
    {
+
       LOGDISABLESTDOUT();
-      iface_ = LevelDBWrapper::GetInterfacePtr();
       magic_ = READHEX(MAINNET_MAGIC_BYTES);
       ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
       gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
       zeros_ = READHEX("00000000");
-      DBUtils.setArmoryDbType(ARMORY_DB_BARE);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
 
       blkdir_  = string("./blkfiletest");
       homedir_ = string("./fakehomedir");
       ldbdir_  = string("./ldbtestdir");
 
-      iface_->openDatabases( ldbdir_, ghash_, gentx_, magic_, 
-                             ARMORY_DB_BARE, DB_PRUNE_NONE);
-      if(!iface_->databasesAreOpen())
-         LOGERR << "ERROR OPENING DATABASES FOR TESTING!";
+      rmdir(blkdir_);
+      rmdir(homedir_);
+      rmdir(ldbdir_);
 
       mkdir(blkdir_);
       mkdir(homedir_);
+      mkdir(ldbdir_);
 
       // Put the first 5 blocks into the blkdir
       blk0dat_ = BtcUtils::getBlkFilename(blkdir_, 0);
-      BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
+      setBlocks({"0", "1", "2", "3", "4", "5"}, blk0dat_);
 
-      TheBDM.SelectNetwork("Main");
-      TheBDM.SetBlkFileLocation(blkdir_);
-      TheBDM.SetHomeDirLocation(homedir_);
-      TheBDM.SetLevelDBLocation(ldbdir_);
+      config.armoryDbType = ARMORY_DB_BARE;
+      config.pruneType = DB_PRUNE_NONE;
+      config.blkFileLocation = blkdir_;
+      config.levelDBLocation = ldbdir_;
+      
+      config.genesisBlockHash = ghash_;
+      config.genesisTxHash = gentx_;
+      config.magicBytes = magic_;
 
-      blkHash0 = READHEX("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000");
-      blkHash1 = READHEX("1b5514b83257d924be7f10c65b95b1f3c0e50081e1dfd8943eece5eb00000000");
-      blkHash2 = READHEX("979fc39616bf1dc6b1f88167f76383d44d65ccd0fc99b7f91bcb2c9500000000");
-      blkHash3 = READHEX("50f8231e5fd476f470e1ba4937bc97cb304136c96c765339308935bc00000000");
-      blkHash4 = READHEX("8e121ba0d275f49a21bbc171d7d49890de13c9b9733e0104654d262f00000000");
-      blkHash3A= READHEX("dd63f62ef59d5b6a6da2a36407f76e4e28026a3fd3a46700d284424700000000");
-      blkHash4A= READHEX("bfa204022816102169b4e1d4f78cdf77258048f6d14282144cc01d5500000000");
-      blkHash5A= READHEX("4e049fd71ef7381a73e4f550d97812d1eb0fbd1489c1774e18855f1900000000");
+      theBDM = new BlockDataManager_LevelDB(config);
+      theBDM->openDatabase();
+      iface_ = theBDM->getIFace();
 
-      addrA_ = READHEX("62e907b15cbf27d5425399ebf6f0fb50ebb88f18");
-      addrB_ = READHEX("ee26c56fc1d942be8d7a24b2a1001dd894693980");
-      addrC_ = READHEX("cb2abde8bccacc32e893df3a054b9ef7f227a4ce");
-      addrD_ = READHEX("c522664fb0e55cdc5c0cea73b4aad97ec8343232");
-
-      scrAddrA_ = HASH160PREFIX + addrA_;
-      scrAddrB_ = HASH160PREFIX + addrB_;
-      scrAddrC_ = HASH160PREFIX + addrC_;
-      scrAddrD_ = HASH160PREFIX + addrD_;
-
+      theBDV = new BlockDataViewer(theBDM);
    }
 
 
    /////////////////////////////////////////////////////////////////////////////
    virtual void TearDown(void)
    {
-      BlockDataManager_LevelDB::DestroyInstance();
+      delete theBDM;
+      delete theBDV;
 
+      theBDM = nullptr;
+      theBDV = nullptr;
+      
       rmdir(blkdir_);
       rmdir(homedir_);
 
-      char* delstr = new char[4096];
-      sprintf(delstr, "%s/level*", ldbdir_.c_str());
-      rmdir(delstr);
-      delete[] delstr;
-
+      #ifdef _MSC_VER
+         rmdir("./ldbtestdir");
+         mkdir("./ldbtestdir");
+      #else
+         string delstr = ldbdir_ + "/*";
+         rmdir(delstr);
+      #endif
       LOGENABLESTDOUT();
+      CLEANUP_ALL_TIMERS();
    }
 
+   BlockDataManagerConfig config;
 
-
-#if ! defined(_MSC_VER) && ! defined(__MINGW32__)
-
-   /////////////////////////////////////////////////////////////////////////////
-   void rmdir(string src)
-   {
-      char* syscmd = new char[4096];
-      sprintf(syscmd, "rm -rf %s", src.c_str());
-      system(syscmd);
-      delete[] syscmd;
-   }
-
-   /////////////////////////////////////////////////////////////////////////////
-   void mkdir(string newdir)
-   {
-      char* syscmd = new char[4096];
-      sprintf(syscmd, "mkdir -p %s", newdir.c_str());
-      system(syscmd);
-      delete[] syscmd;
-   }
-#endif
-
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
    BinaryData magic_;
    BinaryData ghash_;
    BinaryData gentx_;
@@ -5927,366 +7351,2052 @@ protected:
    string blkdir_;
    string homedir_;
    string ldbdir_;
-   string blk0dat_;;
-
-   BinaryData blkHash0;
-   BinaryData blkHash1;
-   BinaryData blkHash2;
-   BinaryData blkHash3;
-   BinaryData blkHash4;
-   BinaryData blkHash3A;
-   BinaryData blkHash4A;
-   BinaryData blkHash5A;
-
-   BinaryData addrA_;
-   BinaryData addrB_;
-   BinaryData addrC_;
-   BinaryData addrD_;
-   BinaryData scrAddrA_;
-   BinaryData scrAddrB_;
-   BinaryData scrAddrC_;
-   BinaryData scrAddrD_;
+   string blk0dat_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, BuildNoRegisterWlt)
 {
-   TheBDM.doInitialSyncOnLoad(); 
+   TheBDM.doInitialSyncOnLoad( nullProgress ); 
 }
+
+
+class BlockDir : public ::testing::Test
+{
+protected:
+   const string blkdir_  = "./blkfiletest";
+   const string homedir_ = "./fakehomedir";
+   const string ldbdir_  = "./ldbtestdir";
+   
+   string blk0dat_;
+
+   /////////////////////////////////////////////////////////////////////////////
+   virtual void SetUp()
+   {
+      LOGDISABLESTDOUT();
+      
+      mkdir(blkdir_);
+      mkdir(homedir_);
+      
+      blk0dat_ = BtcUtils::getBlkFilename(blkdir_, 0);
+   }
+   
+   /////////////////////////////////////////////////////////////////////////////
+   virtual void TearDown(void)
+   {
+      rmdir(blkdir_);
+      rmdir(homedir_);
+
+      #ifdef _MSC_VER
+         rmdir("./ldbtestdir");
+         mkdir("./ldbtestdir");
+      #else
+         string delstr = ldbdir_ + "/*";
+         rmdir(delstr);
+      #endif
+      LOGENABLESTDOUT();
+      CLEANUP_ALL_TIMERS();
+   }
+
+};
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, HeadersFirst)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+      
+   // Put the first 5 blocks out of order
+   setBlocks({ "0", "1", "2", "4", "3", "5" }, blk0dat_);
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA,
+      TestChain::scrAddrB,
+      TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   
+   bdv.scanWallets();
+   
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, HeadersFirstUpdate)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+      
+   // Put the first 5 blocks out of order
+   setBlocks({ "0", "1", "2" }, blk0dat_);
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA,
+      TestChain::scrAddrB,
+      TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   
+   bdv.scanWallets();
+   
+   appendBlocks({ "4", "3", "5" }, blk0dat_);
+   
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+   
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, HeadersFirstReorg)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+
+   setBlocks({ "0", "1"}, blk0dat_);
+
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA,
+      TestChain::scrAddrB,
+      TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+
+   bdm.doInitialSyncOnLoad(nullProgress);
+
+   bdv.scanWallets();
+
+   appendBlocks({ "4A" }, blk0dat_);
+   appendBlocks({ "3" }, blk0dat_);
+
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   appendBlocks({ "2" }, blk0dat_);
+   appendBlocks({ "5" }, blk0dat_);
+
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   appendBlocks({ "4" }, blk0dat_);
+
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   const ScrAddrObj *scrobj;
+
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50 * COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70 * COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20 * COIN);
+
+   appendBlocks({ "5A" }, blk0dat_);
+
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   scrobj = wlt.getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrobj->getFullBalance(), 50 * COIN);
+   scrobj = wlt.getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrobj->getFullBalance(), 30 * COIN);
+   scrobj = wlt.getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrobj->getFullBalance(), 55 * COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, HeadersFirstUpdateTwice)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+      
+   setBlocks({ "0", "1", "2" }, blk0dat_);
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA,
+      TestChain::scrAddrB,
+      TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   
+   bdv.scanWallets();
+   
+   appendBlocks({"5"}, blk0dat_);
+   appendBlocks({"4"}, blk0dat_);
+
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+   appendBlocks({"3"}, blk0dat_);
+   
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+   
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, AddBlockWhileUpdating)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+      
+   setBlocks({ "0", "1", "2" }, blk0dat_);
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA,
+      TestChain::scrAddrB,
+      TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   
+   bdv.scanWallets();
+   
+   BlockDataManager_LevelDB::BlkFileUpdateCallbacks callbacks;
+   callbacks.headersRead = [&]()
+      {
+         appendBlocks({"3"}, blk0dat_);
+      };
+   
+   bdm.readBlkFileUpdate(callbacks);
+   bdv.scanWallets();
+
+   appendBlocks({"4", "5"}, blk0dat_);
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, BlockFileSplit)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+   
+   setBlocks({ "0", "1" }, blk0dat_);
+   
+   std::string blk1dat = BtcUtils::getBlkFilename(blkdir_, 1);
+   setBlocks({ "2", "3", "4","5" }, blk1dat);
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA, TestChain::scrAddrB, TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   bdv.scanWallets();
+   
+   
+   
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockDir, BlockFileSplitUpdate)
+{
+   BlockDataManagerConfig config;
+   config.armoryDbType = ARMORY_DB_BARE;
+   config.pruneType = DB_PRUNE_NONE;
+   config.blkFileLocation = blkdir_;
+   config.levelDBLocation = ldbdir_;
+   
+   config.genesisBlockHash = READHEX(MAINNET_GENESIS_HASH_HEX);
+   config.genesisTxHash = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+   config.magicBytes = READHEX(MAINNET_MAGIC_BYTES);
+      
+   setBlocks({ "0", "1" }, blk0dat_);
+   
+   
+   BlockDataManager_LevelDB bdm(config);
+   bdm.openDatabase();
+   
+   const std::vector<BinaryData> scraddrs
+   {
+      TestChain::scrAddrA, TestChain::scrAddrB, TestChain::scrAddrC
+   };
+
+   BlockDataViewer bdv(&bdm);
+   BtcWallet& wlt = *bdv.registerWallet(scraddrs, "wallet1", false);
+   
+   bdm.doInitialSyncOnLoad( nullProgress ); 
+   bdv.scanWallets();
+ 
+   std::string blk1dat = BtcUtils::getBlkFilename(blkdir_, 1);
+   appendBlocks({ "2", "4", "3", "5" }, blk0dat_);
+   bdm.readBlkFileUpdate();
+   bdv.scanWallets();
+
+   // we should get the same balance as we do for test 'Load5Blocks'
+   const ScrAddrObj *scrobj;
+   
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[0]);
+   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[1]);
+   EXPECT_EQ(scrobj->getFullBalance(), 70*COIN);
+   scrobj = wlt.getScrAddrObjByKey(scraddrs[2]);
+   EXPECT_EQ(scrobj->getFullBalance(), 20*COIN);
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks)
 {
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
-   
-   TheBDM.doInitialSyncOnLoad(); 
-   TheBDM.scanBlockchainForTx(wlt);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
-   ScrAddrObj * scrobj;
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);  // hasn't been scanned yet
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
 
-   EXPECT_EQ(wlt.getFullBalance(), 150*COIN);
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 240*COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 30*COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 30*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(BlockUtilsBare, Load4Blocks_Plus1)
+TEST_F(BlockUtilsBare, Load5Blocks_DamagedBlkFile)
 {
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
-   
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   BtcWallet* wlt;
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   // this test should be reworked to be in terms of createTestChain.py
+   BtcUtils::copyFile("../reorgTest/botched_block.dat", blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 100*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(),   0*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(),  50*COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 150 * COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load4Blocks_Plus2)
+{
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
    // Copy only the first four blocks.  Will copy the full file next to test
    // readBlkFileUpdate method on non-reorg blocks.
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_, 1596);
-   TheBDM.doInitialSyncOnLoad(); 
-   TheBDM.scanBlockchainForTx(wlt);
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 3);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash3);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash3)->isMainBranch());
-   
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate(); 
-   TheBDM.scanBlockchainForTx(wlt);
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash4);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash4)->isMainBranch());
+   setBlocks({ "0", "1", "2", "3" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
 
-   ScrAddrObj * scrobj;
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);  // hasn't been scanned yet
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 3);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash3);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash3).isMainBranch());
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(),  0*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+
+   // Load the remaining blocks.
+   setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5).isMainBranch());
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load4Blocks_ReloadBDM_ZC_Plus2)
+{
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   wlt->addScrAddress(TestChain::scrAddrE);
+
+   // Copy only the first four blocks.  Will copy the full file next to test
+   // readBlkFileUpdate method on non-reorg blocks.
+   setBlocks({ "0", "1", "2", "3" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->enableZeroConf();
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 3);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash3);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash3).isMainBranch());
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+
+   uint64_t fullBalance = wlt->getFullBalance();
+   uint64_t spendableBalance = wlt->getSpendableBalance(4);
+   uint64_t unconfirmedBalance = wlt->getUnconfirmedBalance(4);
+   EXPECT_EQ(fullBalance, 165*COIN);
+   EXPECT_EQ(spendableBalance, 65*COIN);
+   EXPECT_EQ(unconfirmedBalance, 165*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+
+   EXPECT_EQ(wltLB1->getFullBalance(), 10 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 15 * COIN);
+
+   //restart bdm
+   theBDV->unregisterWallet("wallet1");
+   delete theBDM;
+   delete theBDV;
+
+   theBDM = new BlockDataManager_LevelDB(config);
+   theBDM->openDatabase();
+   theBDV = new BlockDataViewer(theBDM);
+   iface_ = theBDM->getIFace();
+
+   wlt = theBDV->registerWallet(scrAddrVec, "wallet1", false);
+   wlt->addScrAddress(TestChain::scrAddrE);
+
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->enableZeroConf();
+   theBDV->scanWallets();
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(4);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(4);
+   EXPECT_EQ(fullBalance, 165 * COIN);
+   EXPECT_EQ(spendableBalance, 65 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 165 * COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+
+   EXPECT_EQ(wltLB1->getFullBalance(), 10 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 15 * COIN);
+
+   //add ZC
+   BinaryData rawZC(TestChain::zcTxSize);
+   FILE *ff = fopen("../reorgTest/ZCtx.tx", "rb");
+   fread(rawZC.getPtr(), TestChain::zcTxSize, 1, ff);
+   fclose(ff);
+
+   BinaryData rawLBZC(TestChain::lbZCTxSize);
+   FILE *flb = fopen("../reorgTest/LBZC.tx", "rb");
+   fread(rawLBZC.getPtr(), TestChain::lbZCTxSize, 1, flb);
+   fclose(flb);
+
+   theBDV->addNewZeroConfTx(rawZC, 0, false);
+   theBDV->addNewZeroConfTx(rawLBZC, 0, false);
+   theBDV->parseNewZeroConfTx();
+   theBDV->scanWallets();
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(4);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(4);
+   EXPECT_EQ(fullBalance, 165*COIN);
+   EXPECT_EQ(spendableBalance, 35*COIN);
+   EXPECT_EQ(unconfirmedBalance, 135*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+
+   EXPECT_EQ(wltLB1->getFullBalance(), 5 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 15 * COIN);
+
+   //
+   setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5).isMainBranch());
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(),  50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(),  70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(),  20*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(5);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(5);
+   EXPECT_EQ(fullBalance, 170*COIN);
+   EXPECT_EQ(spendableBalance, 70*COIN);
+   EXPECT_EQ(unconfirmedBalance, 170*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+
+   EXPECT_EQ(wltLB1->getFullBalance(), 30 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 30 * COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load3Blocks_ZC_Plus3_TestLedgers)
+{
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   wlt->addScrAddress(TestChain::scrAddrE);
+
+   //copy the first 3 blocks
+   setBlocks({ "0", "1", "2" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   //enable ZC after the initial sync
+   theBDV->enableZeroConf();
+
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 2);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash2);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash2).isMainBranch());
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(),  0*COIN);
+
+   uint64_t fullBalance = wlt->getFullBalance();
+   uint64_t spendableBalance = wlt->getSpendableBalance(3);
+   uint64_t unconfirmedBalance = wlt->getUnconfirmedBalance(3);
+   EXPECT_EQ(fullBalance, 105 * COIN);
+   EXPECT_EQ(spendableBalance, 5 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 105 * COIN);
+
+   //add ZC
+   BinaryData rawZC(259);
+   FILE *ff = fopen("../reorgTest/ZCtx.tx", "rb");
+   fread(rawZC.getPtr(), 259, 1, ff);
+   fclose(ff);
+
+   BinaryData ZChash = READHEX(TestChain::zcTxHash256);
+
+   theBDV->addNewZeroConfTx(rawZC, 1300000000, false);
+   theBDV->parseNewZeroConfTx();
+   theBDV->scanWallets();
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 75*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(),  10*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(4);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(4);
+   EXPECT_EQ(fullBalance, 135 * COIN);
+   EXPECT_EQ(spendableBalance, 5 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 135 * COIN);
+
+   //check ledger for ZC
+   LedgerEntry le = wlt->getLedgerEntryForTx(ZChash);
+   EXPECT_EQ(le.getTxTime(), 1300000000);
+   EXPECT_EQ(le.getValue(),  3000000000);
+   EXPECT_EQ(le.getBlockNum(), UINT32_MAX);
+
+   //pull ZC from DB, verify it's carrying the proper data
+   LMDBEnv::Transaction *dbtx = 
+      new LMDBEnv::Transaction(iface_->dbEnv_[HISTORY].get(), LMDB::ReadOnly);
+   StoredTx zcStx;
+   BinaryData zcKey = WRITE_UINT16_BE(0xFFFF);
+   zcKey.append(WRITE_UINT32_LE(0));
+
+   EXPECT_EQ(iface_->getStoredZcTx(zcStx, zcKey), true);
+   EXPECT_EQ(zcStx.thisHash_, ZChash);
+   EXPECT_EQ(zcStx.numBytes_ , TestChain::zcTxSize);
+   EXPECT_EQ(zcStx.fragBytes_, 190);
+   EXPECT_EQ(zcStx.numTxOut_, 2);
+   EXPECT_EQ(zcStx.stxoMap_.begin()->second.getValue(), 10 * COIN);
+
+   //check ZChash in DB
+   EXPECT_EQ(iface_->getTxHashForLdbKey(zcKey), ZChash);
+
+   delete dbtx;
+
+   //restart bdm
+   theBDV->unregisterWallet("wallet1");
+   delete theBDM;
+   delete theBDV;
+
+   theBDM = new BlockDataManager_LevelDB(config);
+   theBDM->openDatabase();
+   theBDV = new BlockDataViewer(theBDM);
+   iface_ = theBDM->getIFace();
+
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->enableZeroConf();
+   theBDV->scanWallets();
+
+   //add 4th block
+   setBlocks({ "0", "1", "2", "3" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 3);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash3);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash3).isMainBranch());
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(5);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(5);
+   EXPECT_EQ(fullBalance, 165 * COIN);
+   EXPECT_EQ(spendableBalance, 35 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 165 * COIN);
+
+   le = wlt->getLedgerEntryForTx(ZChash);
+   EXPECT_EQ(le.getTxTime(), 1300000000);
+   EXPECT_EQ(le.getValue(),  3000000000);
+   EXPECT_EQ(le.getBlockNum(), UINT32_MAX);
+
+   //The BDM was recycled, but the ZC is still live, and the mempool should 
+   //have reloaded it. Pull from DB and verify
+   dbtx = new LMDBEnv::Transaction(iface_->dbEnv_[HISTORY].get(), LMDB::ReadOnly);
+   StoredTx zcStx2;
+
+   EXPECT_EQ(iface_->getStoredZcTx(zcStx2, zcKey), true);
+   EXPECT_EQ(zcStx2.thisHash_, ZChash);
+   EXPECT_EQ(zcStx2.numBytes_, TestChain::zcTxSize);
+   EXPECT_EQ(zcStx2.fragBytes_, 190);
+   EXPECT_EQ(zcStx2.numTxOut_, 2);
+   EXPECT_EQ(zcStx2.stxoMap_.begin()->second.getValue(), 10 * COIN);
+
+   delete dbtx;
+
+   //add 5th block
+   setBlocks({ "0", "1", "2", "3", "4" }, blk0dat_);
+
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash4);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4).isMainBranch());
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(5);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(5);
+   EXPECT_EQ(fullBalance, 120 * COIN);
+   EXPECT_EQ(spendableBalance, 40 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 120 * COIN);
+
+   dbtx = new LMDBEnv::Transaction(iface_->dbEnv_[HISTORY].get(), LMDB::ReadOnly);
+   StoredTx zcStx3;
+
+   EXPECT_EQ(iface_->getStoredZcTx(zcStx3, zcKey), true);
+   EXPECT_EQ(zcStx3.thisHash_, ZChash);
+   EXPECT_EQ(zcStx3.numBytes_, TestChain::zcTxSize);
+   EXPECT_EQ(zcStx3.fragBytes_, 190); // Not sure how Python can get this value
+   EXPECT_EQ(zcStx3.numTxOut_, 2);
+   EXPECT_EQ(zcStx3.stxoMap_.begin()->second.getValue(), 10 * COIN);
+
+   delete dbtx;
+
+   //add 6th block
+   setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5).isMainBranch());
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20 * COIN);
+
+   fullBalance = wlt->getFullBalance();
+   spendableBalance = wlt->getSpendableBalance(5);
+   unconfirmedBalance = wlt->getUnconfirmedBalance(5);
+   EXPECT_EQ(fullBalance, 140 * COIN);
+   EXPECT_EQ(spendableBalance, 40 * COIN);
+   EXPECT_EQ(unconfirmedBalance, 140 * COIN);
+
+   le = wlt->getLedgerEntryForTx(ZChash);
+   EXPECT_EQ(le.getTxTime(), 1231009513);
+   EXPECT_EQ(le.getValue(), 3000000000);
+   EXPECT_EQ(le.getBlockNum(), 5);
+
+   //Tx is now in a block, ZC should be gone from DB
+   dbtx = new LMDBEnv::Transaction(iface_->dbEnv_[HISTORY].get(), LMDB::ReadWrite);
+   StoredTx zcStx4;
+
+   EXPECT_EQ(iface_->getStoredZcTx(zcStx4, zcKey), false);
+
+   delete dbtx;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_FullReorg)
 {
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
+   BtcWallet* wlt;
+   BtcWallet* wlt2;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
 
-   BtcWallet wlt2;
-   wlt2.addScrAddress(scrAddrD_);
-   
-   TheBDM.doInitialSyncOnLoad(); 
-   TheBDM.scanBlockchainForTx(wlt);
-   TheBDM.scanBlockchainForTx(wlt2);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
 
-   BtcUtils::copyFile("../reorgTest/blk_3A.dat", blk0dat_);
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A" }, blk0dat_);
    TheBDM.readBlkFileUpdate();
-   BtcUtils::copyFile("../reorgTest/blk_4A.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate();
-   BtcUtils::copyFile("../reorgTest/blk_5A.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate();
 
-   TheBDM.scanBlockchainForTx(wlt);
-   TheBDM.scanBlockchainForTx(wlt2);
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A", "5A" }, blk0dat_);
 
-   ScrAddrObj * scrobj;
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),150*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(), 10*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   //scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   //EXPECT_EQ(scrobj->getFullBalance(),140*COIN);
+   uint32_t prevBlock = TheBDM.readBlkFileUpdate();
 
-   EXPECT_EQ(wlt.getFullBalance(), 160*COIN);
+   theBDV->scanWallets(prevBlock);
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(),60*COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(),30*COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),60*COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 135*COIN);
+   EXPECT_EQ(wlt2->getFullBalance(), 150*COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 5*COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 10*COIN);
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load5Blocks_DoubleReorg)
+{
+   BtcWallet* wlt;
+   BtcWallet* wlt2;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   setBlocks({ "0", "1", "2", "3", "4A"}, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
+
+   //first reorg: up to 5
+   setBlocks({ "0", "1", "2", "3", "4A", "4", "5" }, blk0dat_);
+   uint32_t prevBlock = TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets(prevBlock);
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20 * COIN);
+   
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 140 * COIN);
+   EXPECT_EQ(wlt2->getFullBalance(), 100 * COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 30 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 30 * COIN);
+
+   //second reorg: up to 5A
+   setBlocks({ "0", "1", "2", "3", "4A", "4", "5", "5A" }, blk0dat_);
+   prevBlock = TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets(prevBlock);
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55 * COIN);
+
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 135 * COIN);
+   EXPECT_EQ(wlt2->getFullBalance(), 150 * COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 5 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 10 * COIN);
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load5Blocks_ReloadBDM_Reorg)
+{
+   BtcWallet* wlt;
+   BtcWallet* wlt2;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   //reload BDM
+   delete theBDV;
+   delete theBDM;
+
+   //add the reorg blocks
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A", "5A" }, blk0dat_);
+
+   theBDM = new BlockDataManager_LevelDB(config);
+   theBDM->openDatabase();
+   iface_ = theBDM->getIFace();
+   theBDV = new BlockDataViewer(theBDM);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
+
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA); //unspent 50
+   EXPECT_EQ(scrObj->getFullBalance(), 50 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB); //spent 50, spent 50, spent 25, spent 5, unspent 30
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC); //unspent 50, unspent 5
+   EXPECT_EQ(scrObj->getFullBalance(), 55 * COIN);
+
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrD); //unspent 5, unspent 50, unspent 5
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrE); //unspent 5, unspent 25
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrF); //spent 20, spent 15, unspent 5, unspent 50, unspent 5
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr); //spent 10, unspent 5
+   EXPECT_EQ(scrObj->getFullBalance(), 5 * COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH); //spent 15
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr); //spent 10, unspent 10
+   EXPECT_EQ(scrObj->getFullBalance(), 10 * COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH); //spent 5
+   EXPECT_EQ(scrObj->getFullBalance(), 0 * COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 135 * COIN);
+   EXPECT_EQ(wlt2->getFullBalance(), 150 * COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 5 * COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 10 * COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, Load5Blocks_ReloadBDM_Reorg_DontTrigger)
+{
+   /***
+   By registering extra addresses after reseting the BDM, this test covers an
+   edge case where the set of registered scrAddr is extended with unscanned
+   scrAddr, so the reorg cannot be performed on the entire set and will be 
+   bypassed instead.
+   ***/
+
+   BtcWallet* wlt;
+   BtcWallet* wlt2;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   //reload BDM
+   delete theBDV;
+   delete theBDM;
+
+   //add the reorg blocks
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A", "5A" }, blk0dat_);
+
+   theBDM = new BlockDataManager_LevelDB(config);
+   theBDM->openDatabase();
+   iface_ = theBDM->getIFace();
+   theBDV = new BlockDataViewer(theBDM);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+
+   scrAddrVec.clear();
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet2", theBDV, &wlt2);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
+
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 55*COIN);
+
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30 * COIN);
+   scrObj = wlt2->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(), 60 * COIN);
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(),  0*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 10*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(),  0*COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(),   135*COIN);
+   EXPECT_EQ(wlt2->getFullBalance(),  150*COIN);
+   EXPECT_EQ(wltLB1->getFullBalance(), 5*COIN);
+   EXPECT_EQ(wltLB2->getFullBalance(), 10*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsBare, CorruptedBlock)
+{
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   {
+      setBlocks({ "0", "1", "2", "3", "4A", "5A" }, blk0dat_);
+      const uint64_t srcsz = BtcUtils::GetFileSize(blk0dat_);
+      BinaryData temp(srcsz);
+      {
+         ifstream is(blk0dat_.c_str(), ios::in  | ios::binary);
+         is.read((char*)temp.getPtr(), srcsz);
+      }
+
+      const std::string dst = blk0dat_;
+
+      ofstream os(dst.c_str(), ios::out | ios::binary);
+      os.write((char*)temp.getPtr(), 100);
+      os.write((char*)temp.getPtr()+120, srcsz-100-20); // erase 20 bytes
+   }
+
+   TheBDM.readBlkFileUpdate();
+   theBDV->scanWallets();
+
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   //scrObj = &wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   //EXPECT_EQ(scrObj->getFullBalance(),140*COIN);
+
+   EXPECT_EQ(wlt->getFullBalance(), 140*COIN);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_RescanOps)
 {
-   ScrAddrObj * scrobj;
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   const ScrAddrObj* scrObj;
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
    // Regular sync
-   TheBDM.doInitialSyncOnLoad();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    // Rebuild on-the-fly
-   TheBDM.doRebuildDatabases();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doRebuildDatabases(nullProgress);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    // Rebuild on-the-fly
-   TheBDM.doFullRescanRegardlessOfSync();
-   TheBDM.scanBlockchainForTx(wlt);
+   // used to be doFullRescanRegardlessOfSync, but this is a synonym
+   TheBDM.doInitialSyncOnLoad_Rebuild(nullProgress);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
-   TheBDM.doSyncIfNeeded();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-
-   // Now add a new addr (with balance) and rescan
-
-   //scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   //EXPECT_EQ(scrobj->getFullBalance(),100*COIN);  // hasn't been scanned yet
-
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_RescanEmptyDB)
 {
-   ScrAddrObj * scrobj;
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
-   TheBDM.doInitialSyncOnLoad_Rescan();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doInitialSyncOnLoad_Rescan(nullProgress);
+   //TheBDM.scanBlockchainForTx(wlt);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_RebuildEmptyDB)
 {
-   ScrAddrObj * scrobj;
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrD);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
    ///////////////////////////////////////////
-   TheBDM.doInitialSyncOnLoad_Rebuild();
+   TheBDM.doInitialSyncOnLoad_Rebuild(nullProgress);
    ///////////////////////////////////////////
 
-   TheBDM.scanBlockchainForTx(wlt);
+   //TheBDM.scanBlockchainForTx(wlt);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
+   const ScrAddrObj* scrObj;
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+   EXPECT_EQ(scrObj->getFullBalance(), 65*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_ForceFullRewhatever)
 {
-   ScrAddrObj * scrobj;
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   const ScrAddrObj* scrObj;
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
    // This is just a regular load
-   TheBDM.doInitialSyncOnLoad();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
-   wlt.addScrAddress(scrAddrD_);
+   //post initial load address registration
+   wlt->addScrAddress(TestChain::scrAddrD);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
+   EXPECT_EQ(TheBDM.sideScanFlag_, true);
+
+   //fire side scan manually since there is no maintenance thread with unit tests
+   theBDM->startSideScan([](const vector<string>&, double prog, unsigned time){});
+
+   //wait on the address scan
+   while (wlt->getMergeFlag() == false)
+      usleep(100);
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   try
+   {
+      scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+      EXPECT_EQ(scrObj, nullptr);
+   }
+   catch (std::runtime_error &)
+   {
+   }
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    ///////////////////////////////////////////
-   TheBDM.doFullRescanRegardlessOfSync();
+   theBDV->reset();
+   TheBDM.doInitialSyncOnLoad_Rescan(nullProgress);
+   theBDV->scanWallets();
    ///////////////////////////////////////////
-   
-   TheBDM.scanBlockchainForTx(wlt);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    ///////////////////////////////////////////
-   TheBDM.doRebuildDatabases();
+   theBDV->reset();
+   TheBDM.doRebuildDatabases(nullProgress);
+   theBDV->scanWallets();
    ///////////////////////////////////////////
-   
-   TheBDM.scanBlockchainForTx(wlt);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsBare, Load5Blocks_ScanWhatIsNeeded)
 {
-   ScrAddrObj * scrobj;
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   BtcWallet* wlt;
+   BtcWallet* wltLB1;
+   BtcWallet* wltLB2;
+   const ScrAddrObj* scrObj;
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+   scrAddrVec.push_back(TestChain::scrAddrE);
+   scrAddrVec.push_back(TestChain::scrAddrF);
+   regWallet(scrAddrVec, "wallet1", theBDV, &wlt);
+   regLockboxes(theBDV, &wltLB1, &wltLB2);
 
    // This is just a regular load
-   TheBDM.doInitialSyncOnLoad();
-   TheBDM.scanBlockchainForTx(wlt);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
-   wlt.addScrAddress(scrAddrD_);
+   wlt->addScrAddress(TestChain::scrAddrD);
 
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
+   EXPECT_EQ(TheBDM.sideScanFlag_, true);
+
+   //fire side scan manually since there is no maintenance thread with unit tests
+   theBDM->startSideScan([](const vector<string>&, double prog, unsigned time){});
+
+   //wait on the address scan
+   while (wlt->getMergeFlag() == false)
+      usleep(100);
+
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+
+   try
+   {
+      scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrD);
+      EXPECT_EQ(scrObj, nullptr);
+   }
+   catch (std::runtime_error &)
+   {
+   }
+
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    ///////////////////////////////////////////
-   TheBDM.doSyncIfNeeded();
+   theBDV->reset();
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
    ///////////////////////////////////////////
 
-   TheBDM.scanBlockchainForTx(wlt);
-
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 
    ///////////////////////////////////////////
-   TheBDM.doSyncIfNeeded();
+   theBDV->reset();
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->scanWallets();
    ///////////////////////////////////////////
 
-   TheBDM.scanBlockchainForTx(wlt);
-
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrA_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrB_);
-   EXPECT_EQ(scrobj->getFullBalance(),  0*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrC_);
-   EXPECT_EQ(scrobj->getFullBalance(), 50*COIN);
-   scrobj = &wlt.getScrAddrObjByKey(scrAddrD_);
-   EXPECT_EQ(scrobj->getFullBalance(),100*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrA);
+   EXPECT_EQ(scrObj->getFullBalance(), 50*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrB);
+   EXPECT_EQ(scrObj->getFullBalance(), 70*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrC);
+   EXPECT_EQ(scrObj->getFullBalance(), 20*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrE);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wlt->getScrAddrObjByKey(TestChain::scrAddrF);
+   EXPECT_EQ(scrObj->getFullBalance(),  5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 5*COIN);
+   scrObj = wltLB1->getScrAddrObjByKey(TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 25*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddr);
+   EXPECT_EQ(scrObj->getFullBalance(), 30*COIN);
+   scrObj = wltLB2->getScrAddrObjByKey(TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(scrObj->getFullBalance(), 0*COIN);
 }
+
+////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+/*
+class FullScanTest : public ::testing::Test
+{
+protected:
+
+   /////////////////////////////////////////////////////////////////////////////
+   virtual void SetUp(void) 
+   {
+      LOGDISABLESTDOUT();
+      //iface_ = LSMWrapper::GetInterfacePtr();
+      magic_ = READHEX(MAINNET_MAGIC_BYTES);
+      ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
+      gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
+      zeros_ = READHEX("00000000");
+      //DBUtils::setArmoryDbType(ARMORY_DB_BARE);
+      //DBUtils::setDbPruneType(DB_PRUNE_NONE);
+
+      blkdatadir_ = string("./databases/leveldb_blkdata");
+   }
+
+   /////
+   virtual void TearDown(void)
+   {
+      // This seem to be the best way to remove a dir tree in C++ (in Linux)
+      //iface_->closeDatabases();
+      iface_ = NULL;
+
+   }
+
+   leveldb::Slice binaryDataToSlice(BinaryData const & bd) 
+         {return leveldb::Slice((char*)bd.getPtr(), bd.getSize());}
+   leveldb::Slice binaryDataRefToSlice(BinaryDataRef const & bdr)
+         {return leveldb::Slice((char*)bdr.getPtr(), bdr.getSize());}
+
+   BinaryRefReader sliceToRefReader(leveldb::Slice slice)
+         { return BinaryRefReader( (uint8_t*)(slice.data()), slice.size()); }
+
+   LMDBBlockDatabase* iface_;
+   BinaryData magic_;
+   BinaryData ghash_;
+   BinaryData gentx_;
+   BinaryData zeros_;
+   string blkdatadir_;
+   BinaryRefReader currKey_;
+   BinaryRefReader currVal_;
+
+};
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(FullScanTest, DISABLED_TestSuperRaw)
+{
+
+
+   leveldb::Options opts;
+   opts.compression = leveldb::kNoCompression;
+   //opts.block_cache = leveldb::NewLRUCache(2048 * 1024 * 1024);   
+   leveldb::DB* dbptr;
+   leveldb::Status stat = leveldb::DB::Open(opts, blkdatadir_, &dbptr);
+   
+   if(!stat.ok())
+      cout << "Error opening DB: " << stat.ToString() << endl;
+
+   leveldb::ReadOptions readopts;
+   readopts.fill_cache = false;
+   //cout << "fill_cache = true (bad)" << endl;
+   cout << "fill_cache = false (good)" << endl;
+   leveldb::Iterator* iter = dbptr->NewIterator(readopts);
+
+
+   BinaryData firstKeyBD = DBUtils::getBlkDataKey(0,0);
+   leveldb::Slice firstKey = binaryDataToSlice(firstKeyBD);
+   iter->Seek(firstKey);
+
+   uint32_t hgt;
+   uint8_t  dup;
+   uint16_t txi;
+   uint16_t txo;
+   BLKDATA_TYPE bdtype;
+   BinaryData pref = WRITE_UINT8_LE((uint8_t)DB_PREFIX_TXDATA);
+
+   // This scraddr should have 8 tx
+   BinaryData scraddr = WRITE_UINT8_LE((uint8_t)TXOUT_SCRIPT_STDHASH160);
+   scraddr = scraddr + READHEX("33da2736b16558c9569cc226d4b349ce1aacf649");
+      
+
+   vector<OutPoint> opList;
+
+   BinaryData currTxHash(32);
+   while(iter->Valid())
+   {
+      currKey_.setNewData((uint8_t*)iter->key().data(), iter->key().size());
+      currVal_.setNewData((uint8_t*)iter->value().data(), iter->value().size());
+
+      if(!currKey_.getRawRef().startsWith(pref))
+         break;
+
+      bdtype = DBUtils::readBlkDataKey(currKey_, hgt, dup, txi, txo);      
+
+      if(bdtype==BLKDATA_HEADER)
+      {
+         // Need to do a little reading&processing to make sure it is actually pulling dat afrom disk
+         currVal_.advance(4);
+         BinaryData hhash = currVal_.get_BinaryData(80);
+         if(hhash.startsWith(zeros_))
+            cout << "Starts with four zeros!" << endl;
+      }
+      else if(bdtype==BLKDATA_TX)
+      {
+         currVal_.advance(2);
+         currTxHash = currVal_.get_BinaryData(32);
+      }
+      else if(bdtype==BLKDATA_TXOUT)
+      {
+         currVal_.advance(2);
+
+         TxOut txout;
+         txout.unserialize(currVal_);
+         if(txout.getScrAddressStr() == scraddr)
+         {
+            cout << "Found a txout!" << endl;
+            opList.push_back(OutPoint(currTxHash, txo));
+         }
+      }
+      else if(bdtype==NOT_BLKDATA)
+         break;
+
+      iter->Next();
+   }
+
+   for(uint32_t o=0; o<opList.size(); o++)
+   {
+      cout << o << ": " << opList[o].getTxHash().toHexStr().c_str()
+                << ":" << opList[o].getTxOutIndex() << endl;
+   }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(FullScanTest, DISABLED_CreateSuperRawDB)
+{
+   string dbdir("./rawdbdir");
+   
+   leveldb::Options opts;
+   opts.compression = leveldb::kNoCompression;
+   opts.create_if_missing = true;
+   opts.block_size = 8*1024*1024;
+   leveldb::DB* dbptr;
+   leveldb::Status stat = leveldb::DB::Open(opts, dbdir, &dbptr);
+   
+   if(!stat.ok())
+      cout << "Error opening DB: " << stat.ToString() << endl;
+
+   //leveldb::Iterator* iter = dbptr->NewIterator(leveldb::ReadOptions());
+   uint32_t i=0;
+   uint32_t nblk=0;
+   uint64_t lastWrite=0;
+   uint64_t writeBytes=0;
+   string fname = BtcUtils::getBlkFilename("/home/alan/.bitcoin/blocks", i);
+   
+   BinaryData magic(4), nbytes(4);
+   BinaryData expectedMagicBytes = READHEX(MAINNET_MAGIC_BYTES);
+
+   leveldb::WriteBatch* writebatch = new leveldb::WriteBatch;
+   
+   while(BtcUtils::GetFileSize(fname) != FILE_DOES_NOT_EXIST)
+   {
+      cout << "Opening: " << fname.c_str() << "(" << BtcUtils::GetFileSize(fname) << ")" << endl;
+      ifstream is(fname.c_str(), ios::in | ios::binary);
+
+      while(!is.eof())
+      {
+         // Magic bytes
+         is.read((char*)magic.getPtr(), 4);
+         if(magic != expectedMagicBytes)
+            break;         
+
+         // Number of bytes in block
+         is.read((char*)nbytes.getPtr(), 4);
+         uint32_t blkBytes = READ_UINT32_LE(nbytes.getPtr());
+
+         // Reading
+         cout << nblk << " Reading " << blkBytes << " bytes in block; ";
+         BinaryReader br(blkBytes);
+         is.read((char*)br.exposeDataPtr(), blkBytes);
+
+         br.advance(80);
+         uint32_t numTx = (uint32_t)br.get_var_int();
+         cout << "Number of tx in block: " << numTx << endl;
+         for(uint32_t tx=0; tx<numTx; tx++)
+         {
+            uint32_t txSize = BtcUtils::TxCalcLength(br.getCurrPtr());
+            BinaryData rawTx, txHash;
+            br.get_BinaryData(rawTx, txSize);
+            BtcUtils::getHash256(rawTx, txHash);
+            leveldb::Slice ldbKey((char*)txHash.getPtr(), 32);
+            leveldb::Slice ldbVal((char*)rawTx.getPtr(), txSize);
+         
+            writeBytes += (uint64_t)txSize;
+            writebatch->Put(ldbKey, ldbVal);
+
+         }
+
+         if(writeBytes - lastWrite > 1024*1024*1024)
+         {
+            lastWrite = writeBytes;
+            dbptr->Write(leveldb::WriteOptions(), writebatch);
+            writebatch->Clear();
+         }
+         nblk++;
+   
+      }
+
+
+      i++;
+      fname = BtcUtils::getBlkFilename("/home/alan/.bitcoin/blocks", i);
+
+   }
+
+   dbptr->Write(leveldb::WriteOptions(), writebatch);
+   writebatch->Clear();
+   delete writebatch;
+   delete dbptr;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(FullScanTest, ReadSuperRawDB)
+{
+   string dbdir("./rawdbdir");
+   BinaryData scraddr = WRITE_UINT8_LE((uint8_t)TXOUT_SCRIPT_STDHASH160);
+   scraddr = scraddr + READHEX("33da2736b16558c9569cc226d4b349ce1aacf649");
+   
+   leveldb::Options opts;
+   opts.compression = leveldb::kNoCompression;
+   opts.block_cache = leveldb::NewLRUCache(2048 * 1024 * 1024);   
+   opts.block_size = 8*1024*1024;
+   leveldb::DB* dbptr;
+   leveldb::Status stat = leveldb::DB::Open(opts, dbdir, &dbptr);
+   
+   if(!stat.ok())
+      cout << "Error opening DB: " << stat.ToString() << endl;
+   
+   leveldb::ReadOptions readopts;
+   readopts.fill_cache = false;
+   leveldb::Iterator* iter = dbptr->NewIterator(readopts);
+   iter->SeekToFirst();
+
+   vector<uint32_t> txinOffsets, txoutOffsets;
+   while(iter->Valid())
+   {
+      currKey_.setNewData((uint8_t*)iter->key().data(), iter->key().size());
+      currVal_.setNewData((uint8_t*)iter->value().data(), iter->value().size());
+
+      uint8_t const * txPtr = currVal_.exposeDataPtr();
+      BtcUtils::TxCalcLength(txPtr, &txinOffsets, &txoutOffsets);
+
+      for(uint32_t txo=0; txo<txoutOffsets.size()-1; txo++)
+      {
+         uint32_t start = txoutOffsets[txo];
+         uint32_t sz    = txoutOffsets[txo+1] - start;
+         BinaryDataRef txoRef(txPtr+start, sz);
+         TxOut txout;
+         txout.unserialize(txoRef);
+         if(txout.getScrAddressStr() == scraddr)
+         {
+            cout << "Found a txout!" << endl;
+         }
+      }
+
+      iter->Next();
+   }
+   
+   cout << "Done!" << endl;
+
+}
+*/
+
 
 class LoadTestnetBareTest : public ::testing::Test
 {
 protected:
+   BlockDataManager_LevelDB *theBDM;
+   BlockDataViewer          *theBDV;
 
    /////////////////////////////////////////////////////////////////////////////
    virtual void TearDown(void)  {}
 
    virtual void SetUp(void) 
    {
-      DBUtils.setArmoryDbType(ARMORY_DB_BARE);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//       DBUtils::setArmoryDbType(ARMORY_DB_BARE);
+//       DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
       blkdir_  = string("/home/alan/.bitcoin/testnet3/blocks");
       homedir_ = string("/home/alan/.armory/testnet3");
@@ -6295,11 +9405,19 @@ protected:
 
       mkdir(ldbdir_);
       mkdir(homedir_);
-
-      TheBDM.SelectNetwork("Test");
-      TheBDM.SetBlkFileLocation(blkdir_);
-      TheBDM.SetHomeDirLocation(homedir_);
-      TheBDM.SetLevelDBLocation(ldbdir_);
+      
+      BlockDataManagerConfig config;
+      
+      config.armoryDbType = ARMORY_DB_BARE;
+      config.pruneType = DB_PRUNE_NONE;
+      config.blkFileLocation = blkdir_;
+      config.levelDBLocation = ldbdir_;
+      
+      config.selectNetwork("Test");
+      
+      theBDM = new BlockDataManager_LevelDB(config);
+      theBDV = new BlockDataViewer(theBDM);
+      CLEANUP_ALL_TIMERS();
    }
 
    void mkdir(string newdir)
@@ -6310,7 +9428,7 @@ protected:
       delete[] syscmd;
    }
 
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
    BinaryData magic_;
    BinaryData ghash_;
    BinaryData gentx_;
@@ -6319,35 +9437,22 @@ protected:
    string blkdir_;
    string homedir_;
    string ldbdir_;
-   string blk0dat_;;
-
-   BinaryData addrA_;
-   BinaryData addrB_;
-   BinaryData addrC_;
-   BinaryData addrD_;
-   BinaryData scrAddrA_;
-   BinaryData scrAddrB_;
-   BinaryData scrAddrC_;
-   BinaryData scrAddrD_;
+   string blk0dat_;
 };
+
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(LoadTestnetBareTest, DISABLED_StepThroughDebug_usually_disabled)
 {
-   // These aren't actually testnet addr, balances will be zero
-   BinaryData scrAddrA_ = READHEX("0062e907b15cbf27d5425399ebf6f0fb50ebb88f18");
-   BinaryData scrAddrB_ = READHEX("00ee26c56fc1d942be8d7a24b2a1001dd894693980");
-   BinaryData scrAddrC_ = READHEX("00cb2abde8bccacc32e893df3a054b9ef7f227a4ce");
-    
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
 
-   TheBDM.doInitialSyncOnLoad();
-   TheBDM.scanBlockchainForTx(wlt);
-   TheBDM.DestroyInstance();
+   BtcWallet& wlt = *theBDV->registerWallet(scrAddrVec, "wallet1", false);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   //TheBDM.scanBlockchainForTx(wlt);
 }
 
 
@@ -6359,12 +9464,13 @@ TEST_F(LoadTestnetBareTest, DISABLED_StepThroughDebug_usually_disabled)
 class BlockUtilsSuper : public ::testing::Test
 {
 protected:
+   BlockDataManager_LevelDB TheBDM;
+   BlockDataViewer*         theBDV;
 
    /////////////////////////////////////////////////////////////////////////////
    virtual void SetUp(void) 
    {
       LOGDISABLESTDOUT();
-      iface_ = LevelDBWrapper::GetInterfacePtr();
       magic_ = READHEX(MAINNET_MAGIC_BYTES);
       ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
       gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
@@ -6374,67 +9480,92 @@ protected:
       homedir_ = string("./fakehomedir");
       ldbdir_  = string("./ldbtestdir");
 
-
       mkdir(blkdir_);
       mkdir(homedir_);
 
       // Put the first 5 blocks into the blkdir
       blk0dat_ = BtcUtils::getBlkFilename(blkdir_, 0);
-      BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
+      setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
 
-      TheBDM.SetDatabaseModes(ARMORY_DB_SUPER, DB_PRUNE_NONE);
-      TheBDM.SelectNetwork("Main");
-      TheBDM.SetBlkFileLocation(blkdir_);
-      TheBDM.SetHomeDirLocation(homedir_);
-      TheBDM.SetLevelDBLocation(ldbdir_);
+      config_.armoryDbType = ARMORY_DB_SUPER;
+      config_.pruneType = DB_PRUNE_NONE;
+      config_.blkFileLocation = blkdir_;
+      config_.levelDBLocation = ldbdir_;
+      
+      config_.genesisBlockHash = ghash_;
+      config_.genesisTxHash = gentx_;
+      config_.magicBytes = magic_;
+      
+      theBDM = new BlockDataManager_LevelDB(config_);
+      theBDM->openDatabase();
+      theBDV = new BlockDataViewer(theBDM);
 
-      iface_->openDatabases( ldbdir_, ghash_, gentx_, magic_, 
-                             ARMORY_DB_SUPER, DB_PRUNE_NONE);
-      if(!iface_->databasesAreOpen())
-         LOGERR << "ERROR OPENING DATABASES FOR TESTING!";
-
-      blkHash0 = READHEX("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000");
-      blkHash1 = READHEX("1b5514b83257d924be7f10c65b95b1f3c0e50081e1dfd8943eece5eb00000000");
-      blkHash2 = READHEX("979fc39616bf1dc6b1f88167f76383d44d65ccd0fc99b7f91bcb2c9500000000");
-      blkHash3 = READHEX("50f8231e5fd476f470e1ba4937bc97cb304136c96c765339308935bc00000000");
-      blkHash4 = READHEX("8e121ba0d275f49a21bbc171d7d49890de13c9b9733e0104654d262f00000000");
-      blkHash3A= READHEX("dd63f62ef59d5b6a6da2a36407f76e4e28026a3fd3a46700d284424700000000");
-      blkHash4A= READHEX("bfa204022816102169b4e1d4f78cdf77258048f6d14282144cc01d5500000000");
-      blkHash5A= READHEX("4e049fd71ef7381a73e4f550d97812d1eb0fbd1489c1774e18855f1900000000");
-
-      addrA_ = READHEX("62e907b15cbf27d5425399ebf6f0fb50ebb88f18");
-      addrB_ = READHEX("ee26c56fc1d942be8d7a24b2a1001dd894693980");
-      addrC_ = READHEX("cb2abde8bccacc32e893df3a054b9ef7f227a4ce");
-      addrD_ = READHEX("c522664fb0e55cdc5c0cea73b4aad97ec8343232");
-
-      scrAddrA_ = HASH160PREFIX + addrA_;
-      scrAddrB_ = HASH160PREFIX + addrB_;
-      scrAddrC_ = HASH160PREFIX + addrC_;
-      scrAddrD_ = HASH160PREFIX + addrD_;
-
+      iface_ = theBDM->getIFace();
    }
 
 
    /////////////////////////////////////////////////////////////////////////////
    virtual void TearDown(void)
    {
-      BlockDataManager_LevelDB::DestroyInstance();
-     
-     rmdir(blkdir_);
+      delete theBDM;
+      delete theBDV;
+      
+      theBDM = nullptr;
+      theBDV = nullptr;
+
+      rmdir(blkdir_);
       rmdir(homedir_);
 
-      char* delstr = new char[4096];
-      sprintf(delstr, "%s/level*", ldbdir_.c_str());
-      rmdir(delstr);
-      delete[] delstr;
-
+      #ifdef _MSC_VER
+         rmdir(ldbdir_);
+         mkdir(ldbdir_);
+      #else
+         std::string d = ldbdir_ + "/*";
+         rmdir(d);
+      #endif
       LOGENABLESTDOUT();
+      CLEANUP_ALL_TIMERS();
    }
 
 
+   // Run this before registering a BDM.
+   void regWallet(const vector<BinaryData>& scrAddrs, const string& wltName,
+                  BlockDataViewer*& inBDV, BtcWallet** inWlt)
+   {
+      // Register the standalone address wallet. (All registrations should be
+      // done before initializing the BDM. This is critical!)
+      *inWlt = inBDV->registerWallet(scrAddrs, wltName, false);
+   }
+
+
+   // Run this before registering a BDM. (For now, just make the two lockboxes a
+   // package deal. Code can be altered later if needed.)
+   void regLockboxes(BlockDataViewer*& inBDV, BtcWallet** inLB1,
+                     BtcWallet** inLB2)
+   {
+      // Register the two lockboxes. Note that the lockbox data is pulled from
+      // createTestChain.py, the script that built most of the blocks used in
+      // these unit tests. Python, not C++, is where we find the code needed to
+      // generate the data required by C++ lockboxes. If the lockboxes and/or
+      // blocks are redone, this data's automatically redone.
+      // LB1 = AddrB + AddrC
+      // LB2 = AddrD + AddrE
+      const vector<BinaryData> lb1ScrAddrs
+      {
+         TestChain::lb1ScrAddr,
+         TestChain::lb1ScrAddrP2SH
+      };
+      const vector<BinaryData> lb2ScrAddrs
+      {
+         TestChain::lb2ScrAddr,
+         TestChain::lb2ScrAddrP2SH
+      };
+      *inLB1 = inBDV->registerLockbox(lb1ScrAddrs, TestChain::lb1B58ID, false);
+      *inLB2 = inBDV->registerLockbox(lb2ScrAddrs, TestChain::lb2B58ID, false);
+   }
+
 
 #if ! defined(_MSC_VER) && ! defined(__MINGW32__)
-
    /////////////////////////////////////////////////////////////////////////////
    void rmdir(string src)
    {
@@ -6454,198 +9585,715 @@ protected:
    }
 #endif
 
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
    BinaryData magic_;
    BinaryData ghash_;
    BinaryData gentx_;
    BinaryData zeros_;
+   BlockDataManagerConfig config_;
 
    string blkdir_;
    string homedir_;
    string ldbdir_;
-   string blk0dat_;;
+   string blk0dat_;
 
-   BinaryData blkHash0;
-   BinaryData blkHash1;
-   BinaryData blkHash2;
-   BinaryData blkHash3;
-   BinaryData blkHash4;
-   BinaryData blkHash3A;
-   BinaryData blkHash4A;
-   BinaryData blkHash5A;
-
-   BinaryData addrA_;
-   BinaryData addrB_;
-   BinaryData addrC_;
-   BinaryData addrD_;
-   BinaryData scrAddrA_;
-   BinaryData scrAddrB_;
-   BinaryData scrAddrC_;
-   BinaryData scrAddrD_;
+   NullProgressReporter nullProg_;
 };
 
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, HeadersOnly)
 {
-   EXPECT_EQ(TheBDM.getNumBlocks(), 0);
-   TheBDM.processNewHeadersInBlkFiles(0);
-   
-   EXPECT_EQ(TheBDM.getNumBlocks(), 5);
-   EXPECT_EQ(TheBDM.getTopBlockHeight(), 4);
-   EXPECT_EQ(TheBDM.getTopBlockHash(), blkHash4);
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
+   EXPECT_EQ(&TheBDM.blockchain().top(), &TheBDM.blockchain().getGenesisBlock());
+   TheBDM.readBlkFileUpdate();
+
+   EXPECT_EQ(TheBDM.blockchain().allHeaders().size(), 6);
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
+   EXPECT_EQ(TheBDM.blockchain().top().getThisHash(), TestChain::blkHash5);
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
    //iface_->printAllDatabaseEntries(HEADERS);
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, HeadersOnly_Reorg)
 {
+   // this test is presently of dubious value. I think
+   // at some point the alternate blocks (4A and 5A) had a higher difficulty
+   setBlocks({ "0", "1", "2", "3", "4" }, blk0dat_);
    SETLOGLEVEL(LogLvlError);
-   EXPECT_EQ(TheBDM.getNumBlocks(), 0);
-   TheBDM.processNewHeadersInBlkFiles(0);
-   
-   EXPECT_EQ(TheBDM.getNumBlocks(), 5);
-   EXPECT_EQ(TheBDM.getTopBlockHeight(), 4);
+   EXPECT_EQ(&TheBDM.blockchain().top(), &TheBDM.blockchain().getGenesisBlock());
+   TheBDM.readBlkFileUpdate();
+
+   EXPECT_EQ(TheBDM.blockchain().allHeaders().size(), 5);
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 4);
 
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash4);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash4);
 
-   BtcUtils::copyFile("../reorgTest/blk_3A.dat", BtcUtils::getBlkFilename(blkdir_, 1));
-   TheBDM.processNewHeadersInBlkFiles(1);
+   appendBlocks({ "4A" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+   EXPECT_EQ(TheBDM.blockchain().allHeaders().size(), 6);
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 4);
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash4);
-   EXPECT_FALSE(TheBDM.getHeaderByHash(blkHash3A)->isMainBranch());
-   EXPECT_TRUE( TheBDM.getHeaderByHash(blkHash3 )->isMainBranch());
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash4);
+   EXPECT_FALSE( TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4A).isMainBranch());
+   EXPECT_TRUE( TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4 ).isMainBranch());
 
-   BtcUtils::copyFile("../reorgTest/blk_4A.dat", BtcUtils::getBlkFilename(blkdir_, 2));
-   TheBDM.processNewHeadersInBlkFiles(2);
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash4);
-   EXPECT_FALSE(TheBDM.getHeaderByHash(blkHash3A)->isMainBranch());
-   EXPECT_TRUE( TheBDM.getHeaderByHash(blkHash3 )->isMainBranch());
-   EXPECT_FALSE(TheBDM.getHeaderByHash(blkHash4A)->isMainBranch());
-   EXPECT_TRUE( TheBDM.getHeaderByHash(blkHash4 )->isMainBranch());
-
-   BtcUtils::copyFile("../reorgTest/blk_5A.dat", BtcUtils::getBlkFilename(blkdir_, 3));
-   TheBDM.processNewHeadersInBlkFiles(3);
+   appendBlocks( {"5A"}, blk0dat_);
+   TheBDM.readBlkFileUpdate();
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash5A);
-   EXPECT_FALSE(TheBDM.getHeaderByHash(blkHash3 )->isMainBranch());
-   EXPECT_TRUE( TheBDM.getHeaderByHash(blkHash3A)->isMainBranch());
-   EXPECT_FALSE(TheBDM.getHeaderByHash(blkHash4 )->isMainBranch());
-   EXPECT_TRUE( TheBDM.getHeaderByHash(blkHash4A)->isMainBranch());
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5A);
+   EXPECT_FALSE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4 ).isMainBranch());
+   EXPECT_TRUE( TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4A).isMainBranch());
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5A ).isMainBranch());
 
    SETLOGLEVEL(LogLvlDebug2);
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, Load5Blocks)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-   TheBDM.doInitialSyncOnLoad(); 
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
    StoredScriptHistory ssh;
 
-   iface_->getStoredScriptHistory(ssh, scrAddrA_);
-   EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       2);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(),  50*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      1);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrB_);
-   EXPECT_EQ(ssh.getScriptBalance(),    0*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 140*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       3);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(),   70*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      14);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrC_);
-   EXPECT_EQ(ssh.getScriptBalance(),   50*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(),  60*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       2);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(),   20*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(),  75*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,       8);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrD_);
-   EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       3);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(),  65*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(),  30*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(),   5*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(),   5*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(),  25*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(),  30*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(),   0*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(),  5*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      2);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-TEST_F(BlockUtilsSuper, Load4BlocksPlus1)
+TEST_F(BlockUtilsSuper, Load5Blocks_ReloadBDM)
+{
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   StoredScriptHistory ssh;
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 70 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 14);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 20 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 75 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 8);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 65 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 25 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
+   delete theBDM;
+   theBDM = new BlockDataManager_LevelDB(config_);
+   
+   theBDM->openDatabase();
+   iface_ = theBDM->getIFace();
+
+   theBDM->doInitialSyncOnLoad(nullProgress);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 70 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 14);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 20 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 75 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 8);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 65 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 25 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsSuper, Load3BlocksPlus3)
 {
    // Copy only the first four blocks.  Will copy the full file next to test
    // readBlkFileUpdate method on non-reorg blocks.
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_, 1596);
-   TheBDM.doInitialSyncOnLoad(); 
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 3);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash3);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash3)->isMainBranch());
-   
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate(); 
-   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 4);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash4);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash4)->isMainBranch());
+   setBlocks({ "0", "1", "2"}, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 2);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash2);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash2).isMainBranch());
+
+   appendBlocks({ "3"}, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+
+   appendBlocks({ "5"}, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+
+   delete theBDM;
+   theBDM = new BlockDataManager_LevelDB(config_);
+
+   theBDM->openDatabase();
+   iface_ = theBDM->getIFace();
+
+   theBDM->doInitialSyncOnLoad(nullProgress);
+
+   appendBlocks({ "4" }, blk0dat_);
+
+   TheBDM.readBlkFileUpdate();
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5).isMainBranch());
+
+   StoredScriptHistory ssh;
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 70 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 14);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 20 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 75 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 8);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 65 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 25 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsSuper, RepaidMissingTxio)
+{
+   // Copy only the first four blocks.  Will copy the full file next to test
+   // readBlkFileUpdate method on non-reorg blocks.
+   setBlocks({ "0", "1", "2" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 2);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash2);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash2).isMainBranch());
+
+   appendBlocks({ "3" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+
+   //grab a ssh and delete some utxos
+   StoredScriptHistory ssh;
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+
+   for (auto& subssh : ssh.subHistMap_)
+   {
+      auto txioIter = subssh.second.txioMap_.begin();
+
+      while (txioIter != subssh.second.txioMap_.end())
+      {
+         if (txioIter->second.isUTXO() && 
+             !txioIter->second.isMultisig())
+         {
+            ssh.totalTxioCount_--;
+            ssh.totalUnspent_ -= txioIter->second.getValue();
+            subssh.second.txioMap_.erase(txioIter++);
+         }
+         else
+            ++txioIter;
+      }
+   }
+
+   //delete the keys
+   auto& delKeysThread = [&ssh, this](void)->void
+   { 
+      LMDBEnv::Transaction tx(iface_->dbEnv_[BLKDATA].get(), LMDB::ReadWrite);
+
+      iface_->putStoredScriptHistory(ssh);
+   };
+
+   thread delKeysTID(delKeysThread);
+   delKeysTID.join();
+
+   appendBlocks({ "5" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+
+   appendBlocks({ "4" }, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+
+   EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 5);
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash5);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash5).isMainBranch());
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 70 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 14);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 20 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 75 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 8);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 65 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 25 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, Load5Blocks_Plus2NoReorg)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-   TheBDM.doInitialSyncOnLoad(); 
+//    DBUtils::setArmoryDbType(ARMORY_DB_SUPER);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
 
-   BtcUtils::copyFile("../reorgTest/blk_3A.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate();
-   EXPECT_EQ(TheBDM.getTopBlockHash(),   blkHash4);
-   EXPECT_EQ(TheBDM.getTopBlockHeight(), 4);
-
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A" }, blk0dat_);
    BtcUtils::copyFile("../reorgTest/blk_4A.dat", blk0dat_);
    TheBDM.readBlkFileUpdate();
-   EXPECT_EQ(TheBDM.getTopBlockHash(),   blkHash4);
-   EXPECT_EQ(TheBDM.getTopBlockHeight(), 4);
+   EXPECT_EQ(TheBDM.blockchain().top().getThisHash(),   TestChain::blkHash5);
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
+
+   appendBlocks( {"5A"}, blk0dat_);
+   TheBDM.readBlkFileUpdate();
+   EXPECT_EQ(TheBDM.blockchain().top().getThisHash(),   TestChain::blkHash5);
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
 
    //BtcUtils::copyFile("../reorgTest/blk_5A.dat", blk0dat_);
    //iface_->pprintBlkDataDB(BLKDATA);
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, Load5Blocks_FullReorg)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
-   TheBDM.doInitialSyncOnLoad(); 
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
-   BtcUtils::copyFile("../reorgTest/blk_3A.dat", blk0dat_);
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A" }, blk0dat_);
    TheBDM.readBlkFileUpdate();
-   BtcUtils::copyFile("../reorgTest/blk_4A.dat", blk0dat_);
-   TheBDM.readBlkFileUpdate();
-   BtcUtils::copyFile("../reorgTest/blk_5A.dat", blk0dat_);
+   appendBlocks( {"5A"}, blk0dat_);
    TheBDM.readBlkFileUpdate();
 
-   //iface_->pprintBlkDataDB(BLKDATA);
    StoredScriptHistory ssh;
 
-   iface_->getStoredScriptHistory(ssh, scrAddrA_);
-   EXPECT_EQ(ssh.getScriptBalance(),  150*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 150*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       3);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(),  50*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      1);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrB_);
-   EXPECT_EQ(ssh.getScriptBalance(),   10*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 150*COIN);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(),   30*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 160*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      11);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(),   55*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(),  55*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       4);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrC_);
-   EXPECT_EQ(ssh.getScriptBalance(),    0*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(),  10*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       1);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(),  60*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 60*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      5);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrD_);
-   EXPECT_EQ(ssh.getScriptBalance(),  140*COIN);
-   EXPECT_EQ(ssh.getScriptReceived(), 140*COIN);
-   EXPECT_EQ(ssh.totalTxioCount_,       3);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(),  30*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(),  60*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 95*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(),   5*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(),   0*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      2);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(),  10*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 20*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(),   0*COIN);
+   EXPECT_EQ(ssh.getScriptReceived(),  5*COIN);
+   EXPECT_EQ(ssh.totalTxioCount_,      2);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsSuper, Load5Blocks_ReloadBDM_Reorg)
+{
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   //reload BDM
+   delete theBDM;
+   theBDM = new BlockDataManager_LevelDB(config_);
+   theBDM->openDatabase();
+   iface_ = theBDM->getIFace();
+
+   setBlocks({ "0", "1", "2", "3", "4", "5", "4A", "5A" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   EXPECT_EQ(TheBDM.blockchain().top().getBlockHeight(), 5);
+
+   StoredScriptHistory ssh;
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 160 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 11);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 55 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 55 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 60 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 60 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 60 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 95 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 10 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 20 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BlockUtilsSuper, Load5Blocks_DoubleReorg)
+{
+   StoredScriptHistory ssh;
+
+   setBlocks({ "0", "1", "2", "3", "4A" }, blk0dat_);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   //first reorg: up to 5
+   setBlocks({ "0", "1", "2", "3", "4A", "4", "5" }, blk0dat_);
+   uint32_t prevBlock = TheBDM.readBlkFileUpdate();
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 70 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 230 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 14);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 20 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 75 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 8);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 65 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 65 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 45 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 25 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 40 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
+   //second reorg: up to 5A
+   setBlocks({ "0", "1", "2", "3", "4A", "4", "5", "5A" }, blk0dat_);
+   prevBlock = TheBDM.readBlkFileUpdate();
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
+   EXPECT_EQ(ssh.getScriptBalance(), 50 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 50 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 1);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 160 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 11);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
+   EXPECT_EQ(ssh.getScriptBalance(), 55 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 55 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
+   EXPECT_EQ(ssh.getScriptBalance(), 60 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 60 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 5);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrE);
+   EXPECT_EQ(ssh.getScriptBalance(), 30 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 30 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 4);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrF);
+   EXPECT_EQ(ssh.getScriptBalance(), 60 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 95 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 7);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 5 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb1ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 15 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddr);
+   EXPECT_EQ(ssh.getScriptBalance(), 10 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 20 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 3);
+
+   iface_->getStoredScriptHistory(ssh, TestChain::lb2ScrAddrP2SH);
+   EXPECT_EQ(ssh.getScriptBalance(), 0 * COIN);
+   EXPECT_EQ(ssh.getScriptReceived(), 5 * COIN);
+   EXPECT_EQ(ssh.totalTxioCount_, 2);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -6654,107 +10302,89 @@ TEST_F(BlockUtilsSuper, DISABLED_RestartDBAfterBuild)
 {
    // Copy only the first four blocks.  Will copy the full file next to test
    // readBlkFileUpdate method on non-reorg blocks.
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_, 926);
-   TheBDM.doInitialSyncOnLoad(); 
+   setBlocks({ "0", "1", "2", "3" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 2);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash2);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash2)->isMainBranch());
-   TheBDM.DestroyInstance();
-   
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash2);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash2).isMainBranch());
+
    // Add two more blocks
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
+   appendBlocks({ "4", "5" }, blk0dat_);
 
    // Now reinitialize the DB and hopefully detect the new blocks and update
-   TheBDM.SelectNetwork("Main");
-   TheBDM.SetBlkFileLocation(blkdir_);
-   TheBDM.SetHomeDirLocation(homedir_);
-   TheBDM.SetLevelDBLocation(ldbdir_);
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
 
-   TheBDM.SetDatabaseModes(ARMORY_DB_SUPER, DB_PRUNE_NONE);
-   TheBDM.doInitialSyncOnLoad();
+   TheBDM.doInitialSyncOnLoad(nullProgress);
    
-   EXPECT_EQ(TheBDM.getTopBlockHeightInDB(HEADERS), 4);
-   EXPECT_EQ(TheBDM.getTopBlockHeightInDB(BLKDATA), 4);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash4)->isMainBranch());
+   EXPECT_EQ(getTopBlockHeightInDB(TheBDM, HEADERS), 4);
+   EXPECT_EQ(getTopBlockHeightInDB(TheBDM, BLKDATA), 4);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4).isMainBranch());
 
    StoredScriptHistory ssh;
 
-   iface_->getStoredScriptHistory(ssh, scrAddrA_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
    EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       2);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrB_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
    EXPECT_EQ(ssh.getScriptBalance(),    0*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 140*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       3);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrC_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
    EXPECT_EQ(ssh.getScriptBalance(),   50*COIN);
    EXPECT_EQ(ssh.getScriptReceived(),  60*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       2);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrD_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
    EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       3);
-
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, DISABLED_RestartDBAfterBuild_withReplay)
 {
    // Copy only the first four blocks.  Will copy the full file next to test
    // readBlkFileUpdate method on non-reorg blocks.
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_, 926);
-   TheBDM.doInitialSyncOnLoad(); 
+   setBlocks({ "0", "1", "2", "3" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
    EXPECT_EQ(iface_->getTopBlockHeight(HEADERS), 2);
-   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), blkHash2);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash2)->isMainBranch());
-   TheBDM.DestroyInstance();
-   
+   EXPECT_EQ(iface_->getTopBlockHash(HEADERS), TestChain::blkHash2);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash2).isMainBranch());
+
    // Add two more blocks
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
+   appendBlocks({ "4", "5" }, blk0dat_);
 
    // Now reinitialize the DB and hopefully detect the new blocks and update
-   TheBDM.SelectNetwork("Main");
-   TheBDM.SetBlkFileLocation(blkdir_);
-   TheBDM.SetHomeDirLocation(homedir_);
-   TheBDM.SetLevelDBLocation(ldbdir_);
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
 
    uint32_t replayRewind = 700;
-   TheBDM.SetDatabaseModes(ARMORY_DB_SUPER, DB_PRUNE_NONE);
-   TheBDM.doInitialSyncOnLoad();
-                                               
 
-   TheBDM.doInitialSyncOnLoad();
+   TheBDM.doInitialSyncOnLoad(nullProgress);
    
-   EXPECT_EQ(TheBDM.getTopBlockHeightInDB(HEADERS), 4);
-   EXPECT_EQ(TheBDM.getTopBlockHeightInDB(BLKDATA), 4);
-   EXPECT_TRUE(TheBDM.getHeaderByHash(blkHash4)->isMainBranch());
+   EXPECT_EQ(getTopBlockHeightInDB(TheBDM, HEADERS), 4);
+   EXPECT_EQ(getTopBlockHeightInDB(TheBDM, BLKDATA), 4);
+   EXPECT_TRUE(TheBDM.blockchain().getHeaderByHash(TestChain::blkHash4).isMainBranch());
 
    StoredScriptHistory ssh;
 
-   iface_->getStoredScriptHistory(ssh, scrAddrA_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrA);
    EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       2);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrB_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrB);
    EXPECT_EQ(ssh.getScriptBalance(),    0*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 140*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       3);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrC_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrC);
    EXPECT_EQ(ssh.getScriptBalance(),   50*COIN);
    EXPECT_EQ(ssh.getScriptReceived(),  60*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       2);
 
-   iface_->getStoredScriptHistory(ssh, scrAddrD_);
+   iface_->getStoredScriptHistory(ssh, TestChain::scrAddrD);
    EXPECT_EQ(ssh.getScriptBalance(),  100*COIN);
    EXPECT_EQ(ssh.getScriptReceived(), 100*COIN);
    EXPECT_EQ(ssh.totalTxioCount_,       3);
@@ -6772,41 +10402,35 @@ TEST_F(BlockUtilsSuper, DISABLED_RestartDBAfterBuild_withReplay)
    // it spent again.   In other words, all expected behavior.
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsSuper, DISABLED_TimeAndSpaceTest_usuallydisabled)
 {
-   DBUtils.setArmoryDbType(ARMORY_DB_SUPER);
-   DBUtils.setDbPruneType(DB_PRUNE_NONE);
+//    DBUtils::setArmoryDbType(ARMORY_DB_SUPER);
+//    DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
    string oldblkdir = blkdir_;
    //blkdir_  = string("/home/alan/.bitcoin/blks3");
    //blkdir_  = string("/home/alan/.bitcoin/blocks");
    //TheBDM.SelectNetwork("Main");
    blkdir_  = string("/home/alan/.bitcoin/testnet3/blocks");
-   TheBDM.SelectNetwork("Test");
-   TheBDM.SetBlkFileLocation(blkdir_);
-   TheBDM.SetHomeDirLocation(homedir_);
 
    StoredScriptHistory ssh;
-   TheBDM.doInitialSyncOnLoad(); 
+   TheBDM.doInitialSyncOnLoad(nullProgress);
    BinaryData scrAddr  = READHEX("11b366edfc0a8b66feebae5c2e25a7b6a5d1cf31");
    BinaryData scrAddr2 = READHEX("39aa3d569e06a1d7926dc4be1193c99bf2eb9ee0");
    BinaryData scrAddr3 = READHEX("758e51b5e398a32c6abd091b3fde383291267cfa");
    BinaryData scrAddr4 = READHEX("6c22eb00e3f93acac5ae5d81a9db78a645dfc9c7");
-   EXPECT_EQ(TheBDM.getDBBalanceForHash160(scrAddr), 18*COIN);
-   TheBDM.pprintSSHInfoAboutHash160(scrAddr);
+   EXPECT_EQ(getDBBalanceForHash160(TheBDM, scrAddr), 18*COIN);
+   /*TheBDM.pprintSSHInfoAboutHash160(scrAddr);
    TheBDM.pprintSSHInfoAboutHash160(scrAddr2);
    TheBDM.pprintSSHInfoAboutHash160(scrAddr3);
-   TheBDM.pprintSSHInfoAboutHash160(scrAddr4);
+   TheBDM.pprintSSHInfoAboutHash160(scrAddr4);*/
    blkdir_ = oldblkdir;
    LOGINFO << "waiting... (please copy the DB dir...)";
    int pause;
    cin >> pause;
 }
-
-
-
-
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -6815,11 +10439,12 @@ TEST_F(BlockUtilsSuper, DISABLED_TimeAndSpaceTest_usuallydisabled)
 class BlockUtilsWithWalletTest: public ::testing::Test
 {
 protected:
+   BlockDataManager_LevelDB *theBDM;
+   BlockDataViewer*          theBDV;
    /////////////////////////////////////////////////////////////////////////////
    virtual void SetUp(void) 
    {
       LOGDISABLESTDOUT();
-      iface_ = LevelDBWrapper::GetInterfacePtr();
       magic_ = READHEX(MAINNET_MAGIC_BYTES);
       ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
       gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
@@ -6834,32 +10459,22 @@ protected:
 
       // Put the first 5 blocks into the blkdir
       blk0dat_ = BtcUtils::getBlkFilename(blkdir_, 0);
-      BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
+      setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+      
+      BlockDataManagerConfig config;
+      config.armoryDbType = ARMORY_DB_SUPER;
+      config.pruneType = DB_PRUNE_NONE;
+      config.blkFileLocation = blkdir_;
+      config.levelDBLocation = ldbdir_;
 
-      TheBDM.SetDatabaseModes(ARMORY_DB_SUPER, DB_PRUNE_NONE);
-      TheBDM.SelectNetwork("Main");
-      TheBDM.SetBlkFileLocation(blkdir_);
-      TheBDM.SetHomeDirLocation(homedir_);
-      TheBDM.SetLevelDBLocation(ldbdir_);
-
-      blkHash0 = READHEX("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000");
-      blkHash1 = READHEX("1b5514b83257d924be7f10c65b95b1f3c0e50081e1dfd8943eece5eb00000000");
-      blkHash2 = READHEX("979fc39616bf1dc6b1f88167f76383d44d65ccd0fc99b7f91bcb2c9500000000");
-      blkHash3 = READHEX("50f8231e5fd476f470e1ba4937bc97cb304136c96c765339308935bc00000000");
-      blkHash4 = READHEX("8e121ba0d275f49a21bbc171d7d49890de13c9b9733e0104654d262f00000000");
-      blkHash3A= READHEX("dd63f62ef59d5b6a6da2a36407f76e4e28026a3fd3a46700d284424700000000");
-      blkHash4A= READHEX("bfa204022816102169b4e1d4f78cdf77258048f6d14282144cc01d5500000000");
-      blkHash5A= READHEX("4e049fd71ef7381a73e4f550d97812d1eb0fbd1489c1774e18855f1900000000");
-
-      addrA_ = READHEX("62e907b15cbf27d5425399ebf6f0fb50ebb88f18");
-      addrB_ = READHEX("ee26c56fc1d942be8d7a24b2a1001dd894693980");
-      addrC_ = READHEX("cb2abde8bccacc32e893df3a054b9ef7f227a4ce");
-      addrD_ = READHEX("c522664fb0e55cdc5c0cea73b4aad97ec8343232");
-
-      scrAddrA_ = HASH160PREFIX + addrA_;
-      scrAddrB_ = HASH160PREFIX + addrB_;
-      scrAddrC_ = HASH160PREFIX + addrC_;
-      scrAddrD_ = HASH160PREFIX + addrD_;
+      config.genesisBlockHash = ghash_;
+      config.genesisTxHash = gentx_;
+      config.magicBytes = magic_;
+      
+      theBDM = new BlockDataManager_LevelDB(config);
+      theBDM->openDatabase();
+      theBDV = new BlockDataViewer(theBDM);
+      iface_ = theBDM->getIFace();
 
    }
 
@@ -6867,19 +10482,29 @@ protected:
    /////////////////////////////////////////////////////////////////////////////
    virtual void TearDown(void)
    {
-      BlockDataManager_LevelDB::DestroyInstance();
-     
+      delete theBDM;
+      delete theBDV;
+
+      theBDM = nullptr;
+      theBDV = nullptr;
+
       rmdir(blkdir_);
       rmdir(homedir_);
 
+      #ifdef _MSC_VER
+         rmdir(ldbdir_);
+         mkdir(ldbdir_);
+      #else
+
       char* delstr = new char[4096];
-      sprintf(delstr, "%s/level*", ldbdir_.c_str());
+      sprintf(delstr, "%s/*", ldbdir_.c_str());
       rmdir(delstr);
       delete[] delstr;
+      #endif
 
       LOGENABLESTDOUT();
+      CLEANUP_ALL_TIMERS();
    }
-
 
 
 #if ! defined(_MSC_VER) && ! defined(__MINGW32__)
@@ -6903,7 +10528,7 @@ protected:
    }
 #endif
 
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
    BinaryData magic_;
    BinaryData ghash_;
    BinaryData gentx_;
@@ -6912,107 +10537,205 @@ protected:
    string blkdir_;
    string homedir_;
    string ldbdir_;
-   string blk0dat_;;
+   string blk0dat_;
 
-   BinaryData blkHash0;
-   BinaryData blkHash1;
-   BinaryData blkHash2;
-   BinaryData blkHash3;
-   BinaryData blkHash4;
-   BinaryData blkHash3A;
-   BinaryData blkHash4A;
-   BinaryData blkHash5A;
-
-   BinaryData addrA_;
-   BinaryData addrB_;
-   BinaryData addrC_;
-   BinaryData addrD_;
-
-   BinaryData scrAddrA_;
-   BinaryData scrAddrB_;
-   BinaryData scrAddrC_;
-   BinaryData scrAddrD_;
 };
 
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsWithWalletTest, PreRegisterScrAddrs)
 {
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
 
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
-   TheBDM.doInitialSyncOnLoad();
+   BtcWallet& wlt = *theBDV->registerWallet(scrAddrVec, "wallet1", false);
+   wlt.addScrAddress(TestChain::scrAddrD);
 
-   TheBDM.fetchAllRegisteredScrAddrData();
-   TheBDM.scanBlockchainForTx(wlt);
+   setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+
+   theBDV->scanWallets();
 
    uint64_t balanceWlt;
    uint64_t balanceDB;
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrA_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrA_);
-   EXPECT_EQ(balanceWlt,  100*COIN);
-   EXPECT_EQ(balanceDB,   100*COIN);
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrB_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrB_);
-   EXPECT_EQ(balanceWlt,    0*COIN);
-   EXPECT_EQ(balanceDB,     0*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrC_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrC_);
-   EXPECT_EQ(balanceWlt,   50*COIN);
-   EXPECT_EQ(balanceDB,    50*COIN);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrA)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrA);
+   EXPECT_EQ(balanceWlt, 50*COIN);
+   EXPECT_EQ(balanceDB,  50*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrD_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrD_);
-   EXPECT_EQ(balanceWlt,    0*COIN);  // D is not part of the wallet
-   EXPECT_EQ(balanceDB,   100*COIN);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrB)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrB);
+   EXPECT_EQ(balanceWlt, 70*COIN);
+   EXPECT_EQ(balanceDB,  70*COIN);
+
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrC)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrC);
+   EXPECT_EQ(balanceWlt, 20*COIN);
+   EXPECT_EQ(balanceDB,  20*COIN);
+
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrD);
+   EXPECT_EQ(balanceDB,  65*COIN);
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrE);
+   EXPECT_EQ(balanceDB,  30*COIN);
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrF);
+   EXPECT_EQ(balanceDB,   5*COIN);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsWithWalletTest, PostRegisterScrAddr)
 {
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_);
-   TheBDM.doInitialSyncOnLoad();
+   setBlocks({ "0", "1", "2", "3", "4", "5" }, blk0dat_);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
 
    // We do all the database stuff first, THEN load the addresses
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
-   TheBDM.fetchAllRegisteredScrAddrData();
-   TheBDM.scanRegisteredTxForWallet(wlt);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
+
+   BtcWallet& wlt = *theBDV->registerWallet(scrAddrVec, "wallet1", false);
+   wlt.addScrAddress(TestChain::scrAddrD);
+
+   theBDV->scanWallets();
 
    uint64_t balanceWlt;
    uint64_t balanceDB;
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrA_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrA_);
-   EXPECT_EQ(balanceWlt,  100*COIN);
-   EXPECT_EQ(balanceDB,   100*COIN);
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrB_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrB_);
-   EXPECT_EQ(balanceWlt,    0*COIN);
-   EXPECT_EQ(balanceDB,     0*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrC_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrC_);
-   EXPECT_EQ(balanceWlt,   50*COIN);
-   EXPECT_EQ(balanceDB,    50*COIN);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrA)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrA);
+   EXPECT_EQ(balanceWlt, 50*COIN);
+   EXPECT_EQ(balanceDB,  50*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrD_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrD_);
-   EXPECT_EQ(balanceWlt,    0*COIN);  // D is not part of the wallet
-   EXPECT_EQ(balanceDB,   100*COIN);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrB)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrB);
+   EXPECT_EQ(balanceWlt, 70*COIN);
+   EXPECT_EQ(balanceDB,  70*COIN);
+
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrC)->getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrC);
+   EXPECT_EQ(balanceWlt, 20*COIN);
+   EXPECT_EQ(balanceDB,  20*COIN);
+
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrD);
+   EXPECT_EQ(balanceDB,  65*COIN);
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrE);
+   EXPECT_EQ(balanceDB,  30*COIN);
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrF);
+   EXPECT_EQ(balanceDB,   5*COIN);
+}
+
+
+// Comments need to be added....
+// Most of this data is from the BIP32 test vectors.
+class TestCryptoECDSA : public ::testing::Test
+{
+protected:
+   /////////////////////////////////////////////////////////////////////////////
+   virtual void SetUp(void)
+   {
+      verifyX = READHEX("39a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2");
+      verifyY = READHEX("3cbe7ded0e7ce6a594896b8f62888fdbc5c8821305e2ea42bf01e37300116281");
+
+      multScalarA = READHEX("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+      multScalarB = READHEX("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8");
+      multRes = READHEX("805714a252d0c0b58910907e85b5b801fff610a36bdf46847a4bf5d9ae2d10ed");
+
+      multScalar = READHEX("04bfb2dd60fa8921c2a4085ec15507a921f49cdc839f27f0f280e9c1495d44b5");
+      multPointX = READHEX("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+      multPointY = READHEX("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8");
+      multPointRes = READHEX("7f8bd85f90169a606b0b4323c70e5a12e8a89cbc76647b6ed6a39b4b53825214c590a32f111f857573cf8f2c85d969815e4dd35ae0dc9c7e868195c309b8bada");
+
+      addAX = READHEX("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+      addAY = READHEX("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8");
+      addBX = READHEX("5a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56");
+      addBY = READHEX("7f717885be239daadce76b568958305183ad616ff74ed4dc219a74c26d35f839");
+      addRes = READHEX("fe2f7c8109d9ae628856d51a02ab25300a8757e088fc336d75cb8dc4cc2ce3339013be71e57c3abeee6ad158646df81d92f8c0778f88100eeb61535f9ff9776d");
+
+      invAX = READHEX("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+      invAY = READHEX("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8");
+      invRes = READHEX("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798b7c52588d95c3b9aa25b0403f1eef75702e84bb7597aabe663b82f6f04ef2777");
+
+      compPointPrv1 = READHEX("000f479245fb19a38a1954c5c7c0ebab2f9bdfd96a17563ef28a6a4b1a2a764ef4");
+      compPointPub1 = READHEX("02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29");
+      uncompPointPub1 = READHEX("04e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d292728ad8d58a140050c1016e21f285636a580f4d2711b7fac3957a594ddf416a0");
+
+      compPointPrv2 = READHEX("00e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35");
+      compPointPub2 = READHEX("0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2");
+      uncompPointPub2 = READHEX("0439a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c23cbe7ded0e7ce6a594896b8f62888fdbc5c8821305e2ea42bf01e37300116281");
+
+      invModRes = READHEX("000000000000000000000000000000000000000000000000000000000000006b");
+
+      LOGDISABLESTDOUT();
+   }
+
+
+   /////////////////////////////////////////////////////////////////////////////
+   virtual void TearDown(void)
+   {
+      CLEANUP_ALL_TIMERS();
+   }
+
+
+   SecureBinaryData verifyX;
+   SecureBinaryData verifyY;
+
+   SecureBinaryData multScalarA;
+   SecureBinaryData multScalarB;
+   SecureBinaryData multRes;
+
+   SecureBinaryData multScalar;
+   SecureBinaryData multPointX;
+   SecureBinaryData multPointY;
+   SecureBinaryData multPointRes;
+
+   SecureBinaryData addAX;
+   SecureBinaryData addAY;
+   SecureBinaryData addBX;
+   SecureBinaryData addBY;
+   SecureBinaryData addRes;
+
+   SecureBinaryData invAX;
+   SecureBinaryData invAY;
+   SecureBinaryData invRes;
+
+   SecureBinaryData compPointPrv1;
+   SecureBinaryData uncompPointPub1;
+   SecureBinaryData compPointPub1;
+   SecureBinaryData compPointPrv2;
+   SecureBinaryData uncompPointPub2;
+   SecureBinaryData compPointPub2;
+
+   SecureBinaryData invModRes;
+};
+
+// Verify that a point known to be on the secp256k1 curve is recognized as such.
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(TestCryptoECDSA, VerifySECP256K1Point)
+{
+   EXPECT_TRUE(CryptoECDSA().ECVerifyPoint(verifyX, verifyY));
+}
+
+// Multiply two scalars and check the result.
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(TestCryptoECDSA, SECP256K1MultScalars)
+{
+   SecureBinaryData testRes = CryptoECDSA().ECMultiplyScalars(multScalarA,
+                                                              multScalarB);
+   EXPECT_EQ(multRes, testRes);
+}
+
+// Verify that some public keys (compressed and uncompressed) are valid.
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(TestCryptoECDSA, VerifyPubKeyValidity)
+{
+   EXPECT_TRUE(CryptoECDSA().VerifyPublicKeyValid(compPointPub1));
+   EXPECT_TRUE(CryptoECDSA().VerifyPublicKeyValid(compPointPub2));
+   EXPECT_TRUE(CryptoECDSA().VerifyPublicKeyValid(uncompPointPub1));
+   EXPECT_TRUE(CryptoECDSA().VerifyPublicKeyValid(uncompPointPub2));
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -7023,13 +10746,13 @@ protected:
    /////////////////////////////////////////////////////////////////////////////
    virtual void SetUp(void) 
    {
-      iface_ = LevelDBWrapper::GetInterfacePtr();
+      iface_ = LSMWrapper::GetInterfacePtr();
       magic_ = READHEX(MAINNET_MAGIC_BYTES);
       ghash_ = READHEX(MAINNET_GENESIS_HASH_HEX);
       gentx_ = READHEX(MAINNET_GENESIS_TX_HASH_HEX);
       zeros_ = READHEX("00000000");
-      DBUtils.setArmoryDbType(ARMORY_DB_FULL);
-      DBUtils.setDbPruneType(DB_PRUNE_NONE);
+      DBUtils::setArmoryDbType(ARMORY_DB_FULL);
+      DBUtils::setDbPruneType(DB_PRUNE_NONE);
 
       blkdir_  = string("/home/alan/.bitcoin");
       homedir_ = string("./fakehomedir");
@@ -7044,14 +10767,13 @@ protected:
 
       TheBDM.SelectNetwork("Main");
       TheBDM.SetBlkFileLocation(blkdir_);
-      TheBDM.SetHomeDirLocation(homedir_);
       TheBDM.SetLevelDBLocation(ldbdir_);
 
-      addrA_ = READHEX("b077a2b5e8a53f1d3ef4100117125de6a5b15f6b");
-      addrB_ = READHEX("4c765bca17f9881ad6d4336a1d4ec34a091e5a6f");
+      TestChain::addrA = READHEX("b077a2b5e8a53f1d3ef4100117125de6a5b15f6b");
+      TestChain::addrB = READHEX("4c765bca17f9881ad6d4336a1d4ec34a091e5a6f");
 
-      scrAddrA_ = HASH160PREFIX + addrA_;
-      scrAddrB_ = HASH160PREFIX + addrB_;
+      TestChain::scrAddrA = HASH160PREFIX + TestChain::addrA;
+      TestChain::scrAddrB = HASH160PREFIX + TestChain::addrB;
 
       LOGDISABLESTDOUT();
    }
@@ -7086,7 +10808,7 @@ protected:
    }
 #endif
 
-   InterfaceToLDB* iface_;
+   LMDBBlockDatabase* iface_;
    BinaryData magic_;
    BinaryData ghash_;
    BinaryData gentx_;
@@ -7095,140 +10817,94 @@ protected:
    string blkdir_;
    string homedir_;
    string ldbdir_;
-   string blk0dat_;;
+   string blk0dat_;
 
-   BinaryData blkHash0;
-   BinaryData blkHash1;
-   BinaryData blkHash2;
-   BinaryData blkHash3;
-   BinaryData blkHash4;
-   BinaryData blkHash3A;
-   BinaryData blkHash4A;
-   BinaryData blkHash5A;
-
-   BinaryData addrA_;
-   BinaryData addrB_;
-   BinaryData addrC_;
-   BinaryData addrD_;
-
-   BinaryData scrAddrA_;
-   BinaryData scrAddrB_;
-   BinaryData scrAddrC_;
-   BinaryData scrAddrD_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 TEST_F(BlockUtilsWithWalletTest, TestBalanceMainnet_usuallydisabled)
 {
-   TheBDM.doInitialSyncOnLoad();
+   TheBDM.doInitialSyncOnLoad([] (double,unsigned) {});
 
    // We do all the database stuff first, THEN load the addresses
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
+   BtcWallet wlt(theBDM);
+   wlt.addScrAddress(TestChain::scrAddrA);
+   wlt.addScrAddress(TestChain::scrAddrB);
    TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
+   TheBDM.registerNewScrAddr(TestChain::scrAddrD);
    TheBDM.fetchAllRegisteredScrAddrData();
    TheBDM.scanRegisteredTxForWallet(wlt);
 
    uint64_t balanceWlt;
    uint64_t balanceDB;
    
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrA_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrA_);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrA).getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrA);
    EXPECT_EQ(balanceWlt,  100*COIN);
    EXPECT_EQ(balanceDB,   100*COIN);
    
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrB_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrB_);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrB).getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrB);
    EXPECT_EQ(balanceWlt,    0*COIN);
    EXPECT_EQ(balanceDB,     0*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrC_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrC_);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrC).getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrC);
    EXPECT_EQ(balanceWlt,   50*COIN);
    EXPECT_EQ(balanceDB,    50*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrD_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrD_);
+   balanceWlt = wlt.getScrAddrObjByKey(TestChain::scrAddrD).getFullBalance();
+   balanceDB  = iface_->getBalanceForScrAddr(TestChain::scrAddrD);
    EXPECT_EQ(balanceWlt,    0*COIN);  // D is not part of the wallet
    EXPECT_EQ(balanceDB,   100*COIN);
 }
 */
 
 ////////////////////////////////////////////////////////////////////////////////
-/*  TODO: Whoops, never finished this...
 TEST_F(BlockUtilsWithWalletTest, ZeroConfUpdate)
 {
-   // Copy only the first four blocks
-   BtcUtils::copyFile("../reorgTest/blk_0_to_4.dat", blk0dat_, 1596);
-   TheBDM.doInitialSyncOnLoad();
+   // Copy only the first two blocks
+   setBlocks({"0", "1"}, blk0dat_);
 
-   // We do all the database stuff first, THEN load the addresses
-   BtcWallet wlt;
-   wlt.addScrAddress(scrAddrA_);
-   wlt.addScrAddress(scrAddrB_);
-   wlt.addScrAddress(scrAddrC_);
-   TheBDM.registerWallet(&wlt);
-   TheBDM.registerNewScrAddr(scrAddrD_);
-   TheBDM.fetchAllRegisteredScrAddrData();
-   TheBDM.scanRegisteredTxForWallet(wlt);
+   vector<BinaryData> scrAddrVec;
+   scrAddrVec.push_back(TestChain::scrAddrA);
+   scrAddrVec.push_back(TestChain::scrAddrB);
+   scrAddrVec.push_back(TestChain::scrAddrC);
 
-   uint64_t balanceWlt;
-   uint64_t balanceDB;
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrA_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrA_);
-   EXPECT_EQ(balanceWlt,   50*COIN);
-   EXPECT_EQ(balanceDB,    50*COIN);
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrB_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrB_);
-   EXPECT_EQ(balanceWlt,    0*COIN);
-   EXPECT_EQ(balanceDB,     0*COIN);
+   BtcWallet& wlt = *theBDV->registerWallet(scrAddrVec, "wallet1", false);
+   wlt.addScrAddress(TestChain::scrAddrD);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrC_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrC_);
-   EXPECT_EQ(balanceWlt,  100*COIN);
-   EXPECT_EQ(balanceDB,   100*COIN);
+   TheBDM.doInitialSyncOnLoad(nullProgress);
+   theBDV->enableZeroConf();
+   theBDV->scanWallets();
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrD_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrD_);
-   EXPECT_EQ(balanceWlt,    0*COIN);  // D is not part of the wallet
-   EXPECT_EQ(balanceDB,    50*COIN);
+   BinaryData ZChash = READHEX("b6b6f145742a9072fd85f96772e63a00eb4101709aa34ec5dd59e8fc904191a7");
+   BinaryData rawZC(259);
+   FILE *ff = fopen("../reorgTest/ZCtx.tx", "rb");
+   fread(rawZC.getPtr(), 259, 1, ff);
+   fclose(ff);
 
+   theBDV->addNewZeroConfTx(rawZC, 1300000000, false);
+   theBDV->parseNewZeroConfTx();
+   theBDV->scanWallets();
 
-   BinaryData newTx = READHEX(
-     "01000000019b2468285fc191b7a033b2f32b3de8f0c39d1eac622f5132565f1e"
-     "a8ca74ec8d000000004a4930460221007a284fa21364d749389ff62328e837dd"
-     "2676cbe4e202c0766e3950cbd0a911e40221005ac1541e381b6d358df08cce6a"
-     "2869b76d5ffe05b6aaca5c03ebcba8559c4ede01ffffffff0100f2052a010000"
-     "001976a914c522664fb0e55cdc5c0cea73b4aad97ec834323288ac00000000");
+   EXPECT_EQ(wlt.getScrAddrObjByKey(TestChain::scrAddrA)->getFullBalance(),  50*COIN);
+   EXPECT_EQ(wlt.getScrAddrObjByKey(TestChain::scrAddrB)->getFullBalance(),  70*COIN);
+   EXPECT_EQ(wlt.getScrAddrObjByKey(TestChain::scrAddrC)->getFullBalance(),  10*COIN);
+   EXPECT_EQ(wlt.getScrAddrObjByKey(TestChain::scrAddrD)->getFullBalance(),   0*COIN);
 
-   TheBDM.addNewZeroConfTx(newTx, 1300000000, false);
+   //test ledger entry
+   LedgerEntry le = wlt.getLedgerEntryForTx(ZChash);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrA_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrA_);
-   EXPECT_EQ(balanceWlt,   50*COIN);
-   EXPECT_EQ(balanceDB,    50*COIN);
-   
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrB_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrB_);
-   EXPECT_EQ(balanceWlt,    0*COIN);
-   EXPECT_EQ(balanceDB,     0*COIN);
+   EXPECT_EQ(le.getTxTime(), 1300000000);
+   EXPECT_EQ(le.isSentToSelf(), false);
+   EXPECT_EQ(le.getValue(), 30*COIN);
 
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrC_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrC_);
-   EXPECT_EQ(balanceWlt,  100*COIN);
-   EXPECT_EQ(balanceDB,   100*COIN);
-
-   balanceWlt = wlt.getScrAddrObjByKey(scrAddrD_).getFullBalance();
-   balanceDB  = iface_->getBalanceForScrAddr(scrAddrD_);
-   EXPECT_EQ(balanceWlt,    0*COIN);  // D is not part of the wallet
-   EXPECT_EQ(balanceDB,    50*COIN);
-   
+   //check ZChash in DB
+   BinaryData zcKey = WRITE_UINT16_BE(0xFFFF);
+   zcKey.append(WRITE_UINT32_LE(0));
+   EXPECT_EQ(iface_->getTxHashForLdbKey(zcKey), ZChash);
 }
-*/
 
 // This was really just to time the logging to determine how much impact it 
 // has.  It looks like writing to file is about 1,000,000 logs/sec, while 
@@ -7259,6 +10935,10 @@ TEST(TimeDebugging, WriteNull)
 ////////////////////////////////////////////////////////////////////////////////
 GTEST_API_ int main(int argc, char **argv) 
 {
+   #ifdef _MSC_VER
+      _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+   #endif
+
    std::cout << "Running main() from gtest_main.cc\n";
 
    // Setup the log file 
@@ -7269,9 +10949,7 @@ GTEST_API_ int main(int argc, char **argv)
    int exitCode = RUN_ALL_TESTS();
    
    FLUSHLOG();
-
+   CLEANUPLOG();
 
    return exitCode;
 }
-
-

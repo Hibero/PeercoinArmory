@@ -1,6 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
-//  Copyright(C) 2011-2013, Armory Technologies, Inc.                         //
+//  Copyright (C) 2011-2015, Armory Technologies, Inc.                        //
 //  Distributed under the GNU Affero General Public License (AGPL v3)         //
 //  See LICENSE or http://www.gnu.org/licenses/agpl.html                      //
 //                                                                            //
@@ -61,6 +61,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdio.h>
+#include "OS_TranslatePath.h"
 
 #define FILEANDLINE "(" << __FILE__ << ":" << __LINE__ << ") "
 #define LOGERR    (LoggerObj(LogLvlError ).getLogStream() << FILEANDLINE )
@@ -78,6 +79,7 @@
 #define LOGENABLESTDOUT()   Log::SuppressStdout(false)
 #define SETLOGLEVEL(LOGLVL) Log::SetLogLevel(LOGLVL)
 #define FLUSHLOG()          Log::FlushStreams()
+#define CLEANUPLOG()        Log::CleanUp()
 
 
 #define MAX_LOG_FILE_SIZE (500*1024)
@@ -129,14 +131,14 @@ public:
    { 
       fname_ = logfile;
       truncateFile(fname_, maxSz);
-      fout_.open(fname_.c_str(), ios::app); 
+      fout_.open(OS_TranslatePath(fname_.c_str()), ios::app); 
       fout_ << "\n\nLog file opened at " << NowTimeInt() << ": " << fname_.c_str() << endl;
    }
 
    
    void truncateFile(string logfile, unsigned long long int maxSizeInBytes)
    {
-      ifstream is(logfile.c_str(), ios::in|ios::binary);
+      ifstream is(OS_TranslatePath(logfile.c_str()), ios::in|ios::binary);
 
       // If file does not exist, nothing to do
       if(!is.is_open())
@@ -155,7 +157,7 @@ public:
       else
       {
          // Otherwise, seek to <maxSize> before end of log file
-         ifstream is(logfile.c_str(), ios::in|ios::binary);
+         ifstream is(OS_TranslatePath(logfile.c_str()), ios::in|ios::binary);
          is.seekg(fsize - maxSizeInBytes);
 
          // Allocate buffer to hold the rest of the file (about maxSizeInBytes)
@@ -166,14 +168,19 @@ public:
          
          // Create temporary file and dump the bytes there
          string tempfile = logfile + string("temp");
-         ofstream os(tempfile.c_str(), ios::out|ios::binary);
+         ofstream os(OS_TranslatePath(tempfile.c_str()), ios::out|ios::binary);
          os.write(lastBytes, bytesToCopy);
          os.close();
          delete[] lastBytes;
 
          // Remove the original and rename the temp file to original
-         remove(logfile.c_str());
-         rename(tempfile.c_str(), logfile.c_str());
+			#ifndef _MSC_VER
+				remove(logfile.c_str());
+				rename(tempfile.c_str(), logfile.c_str());
+			#else
+				_wunlink(OS_TranslatePath(logfile).c_str());
+				_wrename(OS_TranslatePath(tempfile).c_str(), OS_TranslatePath(logfile).c_str());
+			#endif
       }
    }
 
@@ -223,13 +230,13 @@ class Log
 public:
    Log(void) : isInitialized_(false), disableStdout_(false) {}
 
-   static Log & GetInstance(const char * filename=NULL)
+   static Log & GetInstance(const char * filename=nullptr)
    {
-      static Log* theOneLog=NULL;
-      if(theOneLog==NULL || filename!=NULL)
+      static Log* theOneLog = nullptr;
+      if (theOneLog == nullptr || filename != nullptr)
       {
          // Close and delete any existing Log object
-         if(theOneLog != NULL)
+         if (theOneLog != nullptr)
          {
             theOneLog->ds_.close();
             delete theOneLog;
@@ -239,7 +246,7 @@ public:
          theOneLog = new Log;
    
          // Open the filestream if it's open
-         if(filename != NULL)
+         if (filename != nullptr)
          {
             theOneLog->ds_.setLogFile(string(filename));
             theOneLog->isInitialized_ = true;
@@ -284,6 +291,8 @@ public:
     static bool isOpen(void) {return GetInstance().ds_.fout_.is_open();}
     static string filename(void) {return GetInstance().ds_.fname_;}
     static void FlushStreams(void) {GetInstance().ds_.FlushStreams();}
+
+    static void CleanUp(void) { delete &GetInstance(); }
 
 protected:
     DualStream ds_;
@@ -370,6 +379,7 @@ inline unsigned long long int NowTimeInt(void)
    time(&t);
    return (unsigned long long int)t;
 }
+
 #else
 
 #include <sys/time.h>

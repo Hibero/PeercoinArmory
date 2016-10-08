@@ -9,13 +9,16 @@
 #
 # Licence: Public domain or CC0
 
-import time
+import base64
 import hashlib
 import random
-import base64
+import time
+
 import CppBlockUtils
-import armoryengine
-from armoryengine import *
+from armoryengine.ArmoryUtils import getVersionString, BTCARMORY_VERSION, \
+   ChecksumError
+
+
 FTVerbose=False
 
 version='0.1.0'
@@ -39,15 +42,14 @@ BITCOIN_ARMORY_COMMENT = 'Comment: Signed by Bitcoin Armory v' +\
    getVersionString(BTCARMORY_VERSION, 3)
 class UnknownSigBlockType(Exception): pass
    
-def randomk():  #better make it stronger
-   # return CppBlockUtils.SecureBinaryData.GenerateRandom(32)
-   rk=0
-   for i in range(8):
-      rk = rk | long(random.random()*0xffffffff)<<(32*i)
-   return rk
+def randomk():  
+   # Using Crypto++ CSPRNG instead of python's
+   sbdRandK = CppBlockUtils.SecureBinaryData().GenerateRandom(32)
+   hexRandK = sbdRandK.toBinStr().encode('hex_codec')
+   return int(hexRandK, 16)
+
 
 # Common constants/functions for Bitcoin
-
 def hash_160_to_bc_address(h160, addrtype=0):
    vh160 = chr(addrtype) + h160
    h = Hash(vh160)
@@ -529,13 +531,13 @@ def FormatText(t, sigctx=False, verbose=False):   #sigctx: False=what is display
    r=''
    te=t.split('\n')
    for l in te:
-      while len(l) and l[len(l)-1] in [' ', '\t', chr(9)]:
+      while len(l) and l[len(l)-1] in [' ', '\r', '\t', chr(9)]:
          l=l[:-1]
       if not len(l) or l[len(l)-1]!='\r':
          l+='\r'
       if not sigctx:
          if len(l) and l[0]=='-':
-            l='- '+l[1:]
+            l='- '+l
       r+=l+'\n'
    r=r[:-2]
 
@@ -602,10 +604,13 @@ def readSigBlock(r):
       signature = base64.b64encode(decoded[:65])
       msg = decoded[65:]
    elif name == CLEARSIGN_MSG_TYPE_MARKER:
-      # Always starts with a blank line (\r\n\r\n) chop that off with the comment oand process the rest
+      # First get rid of the Clearsign marker and everything before it in case the user
+      # added extra lines that would confuse the parsing that follows
+      # The message is preceded by a blank line (\r\n\r\n) chop that off with the comment and process the rest
       # For Clearsign the message is unencoded since the message could include the \r\n\r\n we only ignore
       # the first and combine the rest.
-      msg = RNRN.join(r.split(RNRN)[1:])
+      msg = r.split(BEGIN_MARKER+CLEARSIGN_MSG_TYPE_MARKER+DASHX5)[1]
+      msg = RNRN.join(msg.split(RNRN)[1:])
       msg = msg.split(RN+DASHX5)[0]
       # Only the signature is encoded, use the original r to pull out the encoded signature
       encoded =  r.split(BEGIN_MARKER)[2].split(DASHX5)[1].split(BITCOIN_SIG_TYPE_MARKER)[0]

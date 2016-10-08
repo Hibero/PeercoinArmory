@@ -1,90 +1,109 @@
-COMPILER = g++ 
-#COMPILER_OPTS = -c -g -Wall -fPIC 
-COMPILER_OPTS = -c -O2 -pipe -fPIC 
-#LDFLAGS:=$(shell dpkg-buildflags --get LDFLAGS)
-#CPPFLAGS:=$(shell dpkg-buildflags --get CPPFLAGS)
-LDFLAGS=
-CPPFLAGS=
+CXX = g++
+CC = gcc
+
+ifdef DEBUG
+CFLAGS=-g3 -Wall -pipe -fPIC
+CXXFLAGS=-g3 -Wall -pipe -fPIC
+else
+CFLAGS = -O2 -pipe -fPIC
+CXXFLAGS = -O2 -pipe -fPIC
+endif
+
+ifdef STATIC_LINK
+CFLAGS += -static-libstdc++ -static-libgcc
+CXXFLAGS += -static-libstdc++ -static-libgcc
+endif
+
+platform=$(shell uname)
+
+ifeq ($(shell uname), Darwin)
+MACOSX_DEPLOYMENT_TARGET=10.7
+export MACOSX_DEPLOYMENT_TARGET
+LDFLAGS += -undefined dynamic_lookup -headerpad_max_install_names
+endif
 
 #**************************************************************************
-LINKER = g++ 
-OBJS = UniversalTimer.o BinaryData.o leveldb_wrapper.o StoredBlockObj.o BtcUtils.o BlockObj.o BlockUtils.o EncryptionUtils.o libcryptopp.a libleveldb.a
+LINK = $(CXX)
 
-# This is a script created by goatpig which detects where the python 
-# dependencies are and writes them to the pypaths.txt file. It defines :
-# 		$(PYTHON_LIB) 
-# 		$(PYTHON_LIB_DIR) 
-# 		$(PYVER) 
-# 		$(PYTHON_INCLUDE)
-# If this makefile doesn't work for you, you should manually modify
-# pypaths.txt to define those three variables, and then comment out 
-# DO_EXEC_WHEREISPY line (to prevent the script from attempting to run
-# and overwriting the manual values).
-#DO_EXEC_WHEREISPY := $(shell ./whereispy.sh)
+OBJS = UniversalTimer.o BinaryData.o lmdb_wrapper.o StoredBlockObj.o \
+	BtcUtils.o BlockObj.o BlockUtils.o EncryptionUtils.o \
+	BtcWallet.o LedgerEntry.o ScrAddrObj.o Blockchain.o BlockWriteBatcher.o \
+	BDM_mainthread.o lmdbpp.o BDM_supportClasses.o \
+	BlockDataViewer.o HistoryPager.o Progress.o \
+	libcryptopp.a mdb.o midl.o txio.o
 
-include ./pypaths.txt
+#if python is specified, use it
+ifndef PYVER
+PYVER=python
+PYTHON_INCLUDES=$(shell python-config --includes )
+else
+PYTHON_INCLUDES=$(shell $(PYVER)-config --includes )
+endif
 
-INCLUDE_OPTS += -Icryptopp -Ileveldb/include -DUSE_CRYPTOPP -D__STDC_LIMIT_MACROS 
-LIBRARY_OPTS += -lpthread -Lleveldb -L$(PYTHON_LIB_DIR) -l$(PYVER)
-SWIG_OPTS    += -c++ -python -classic -threads
+CPPFLAGS += $(ARMORY_CPPFLAGS) -Icryptopp -Imdb -DUSE_CRYPTOPP -D__STDC_LIMIT_MACROS
+LDLIBS += -lpthread -Lmdb
+SWIG_OPTS    += -c++ -python -threads
 
+SWIG_INC     += 
 
-UNAME := $(shell uname)
+# rt library used for glibc <2.17. Safe to include for Linux but not OS X.
+# Place at the end due to link order concerns involving Ubuntu 12.04.
+ifneq ($(OS),Windows_NT)
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Linux)
+        LDLIBS += -lrt
+    endif
+endif
 
-SWIG_INC     += -I"$(PYTHON_INCLUDE)"
-STATICPYTHON += "$(PYTHON_LIB)"
+CXXCPP += $(CPPFLAGS) $(PYTHON_INCLUDES) -std=c++11
+
+# OS X requires a little extra elbow grease to support C++11.
+ifneq ($(OS),Windows_NT)
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Darwin)
+        CXXCPP += -stdlib=libc++
+        LDLIBS += -lc++
+    endif
+endif
+
+# each .o file depends on all .h files
+ALL_HEADERS_FOUND=$(wildcard *.h)
+ALL_HEADERS=$(filter-out CppBlockUtils_wrap.h,$(ALL_HEADERS_FOUND))
 
 
 #**************************************************************************
-all :
-	make BlockUtilsTest.out
-	
-swig : $(OBJS) CppBlockUtils_wrap.o
-	g++ -shared -fPIC $(LIBRARY_OPTS) $(OBJS) $(STATICPYTHON) $(CPPFLAGS) $(LDFLAGS) CppBlockUtils_wrap.o -o ../_CppBlockUtils.so
+
+all: ../_CppBlockUtils.so ../qrc_img_resources.py
+
+../_CppBlockUtils.so: $(OBJS) CppBlockUtils_wrap.o
+	$(LINK) -shared -fPIC $(LDFLAGS) $(CXXFLAGS) $(OBJS) $(STATICPYTHON) CppBlockUtils_wrap.o $(LDLIBS) -o ../_CppBlockUtils.so
+
+../qrc_img_resources.py: ../imgList.xml
 	pyrcc4 -o ../qrc_img_resources.py ../imgList.xml
-
-BlockUtilsTest.out : $(OBJS) BlockUtilsTest.cpp
-	$(LINKER) $(OBJS) -o BlockUtilsTest.out $(INCLUDE_OPTS) $(LIBRARY_OPTS) BlockUtilsTest.cpp
 
 
 #**************************************************************************
 libcryptopp.a: Makefile
-	cd cryptopp; make libcryptopp.a; mv libcryptopp.a ..
+	$(MAKE) -C cryptopp libcryptopp.a
+	mv cryptopp/libcryptopp.a .
 
-libleveldb.a: Makefile
-	cd leveldb; make libleveldb.a; mv libleveldb.a ..
+mdb.o: mdb/mdb.c mdb/lmdb.h mdb/midl.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DNDEBUG -c mdb/mdb.c
+midl.o: mdb/midl.c mdb/lmdb.h mdb/midl.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DNDEBUG -c mdb/midl.c
 
-UniversalTimer.o: UniversalTimer.h UniversalTimer.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) UniversalTimer.cpp
+%.o: %.cpp $(ALL_HEADERS)
+	$(CXX) $(CXXCPP) $(CXXFLAGS) -c $<
 
-BinaryData.o: BinaryData.h BinaryData.cpp BtcUtils.h log.h
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) BinaryData.cpp
 
-BtcUtils.o: BtcUtils.h BtcUtils.cpp log.h
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) BtcUtils.cpp
-
-BlockObj.o: log.h BinaryData.h BtcUtils.h BlockObj.h BlockObj.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) BlockObj.cpp
-
-StoredBlockObj.o: log.h BtcUtils.h BinaryData.h StoredBlockObj.h StoredBlockObj.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) StoredBlockObj.cpp
-
-leveldb_wrapper.o: log.h BtcUtils.h BinaryData.h leveldb_wrapper.h leveldb_wrapper.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) leveldb_wrapper.cpp
-
-BlockUtils.o: log.h BlockUtils.h BinaryData.h UniversalTimer.h PartialMerkle.h BlockUtils.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) BlockUtils.cpp
-
-EncryptionUtils.o: log.h BtcUtils.h BinaryData.h EncryptionUtils.h EncryptionUtils.cpp
-	$(COMPILER) $(COMPILER_OPTS) $(INCLUDE_OPTS) EncryptionUtils.cpp
-
-CppBlockUtils_wrap.cxx: log.h BlockUtils.h BinaryData.h BlockObj.h UniversalTimer.h BlockUtils.h BlockUtils.cpp CppBlockUtils.i
+CppBlockUtils_wrap.cxx: $(ALL_HEADERS) CppBlockUtils.i
 	swig $(SWIG_OPTS) -outdir ../ -v CppBlockUtils.i 
 
-CppBlockUtils_wrap.o: log.h BlockUtils.h  BinaryData.h UniversalTimer.h CppBlockUtils_wrap.cxx
-	$(COMPILER) $(SWIG_INC) $(COMPILER_OPTS) $(INCLUDE_OPTS) $(LIBRARY_OPTS) CppBlockUtils_wrap.cxx
+CppBlockUtils_wrap.o: $(ALL_HEADERS) CppBlockUtils_wrap.cxx
+	$(CXX) $(SWIG_INC) $(CXXFLAGS) $(CXXCPP) -c CppBlockUtils_wrap.cxx
 
-
+playground: ../_CppBlockUtils.so playground.cpp $(ALL_HEADERS)
+	$(CXX) $(CXXCPP) $(CXXFLAGS) $(LDFLAGS) $(shell $(PYVER)-config --libs) -Wl,-rpath,$(PWD)/.. ../_CppBlockUtils.so -o playground playground.cpp
 
 ##########################################################################
 # And now we have created all the individual object files specified with 
@@ -92,9 +111,6 @@ CppBlockUtils_wrap.o: log.h BlockUtils.h  BinaryData.h UniversalTimer.h CppBlock
 #************************************************************************
 clean:
 	touch CppBlockUtils.i
-	rm -f *.o *.out 
-	rm pypaths.txt
-	cd cryptopp; make clean;
-	
-
-
+	rm -f *.o *.out *.a
+	rm -f CppBlockUtils_wrap.cxx 
+	$(MAKE) -C cryptopp clean

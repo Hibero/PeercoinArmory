@@ -7,9 +7,9 @@ int pthread_mutex_init(pthread_mutex_t *mu, const int mutex_attr)
 	return 0;
 }
 
-DWORD pthread_self()
+pthread_t pthread_self()
 {
-	return GetCurrentThreadId();
+	return (void*)GetCurrentThreadId();
 }
 
 int pthread_mutex_lock(pthread_mutex_t *mu)
@@ -35,11 +35,30 @@ int pthread_mutex_destroy(pthread_mutex_t *mu)
 
 int pthread_create(pthread_t *tid, pthread_attr_t *attr, void*(*start)(void*), void *arg)
 {
-	if(CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)start, arg, 0, tid)) return 0;
+	if(*tid = (pthread_t)CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)start, arg, 0, 0)) return 0;
 
 	return -1;
 }
 
+int pthread_cancel(pthread_t tid)
+{
+   return (!TerminateThread(tid, 0));
+}
+
+int pthread_join(pthread_t tid, void **value_ptr)
+{
+   WaitForSingleObject(tid, INFINITE);
+   CloseHandle(tid);
+   return 0;
+}
+
+int pthread_detach(pthread_t tid)
+{
+   return !CloseHandle(tid);
+}
+
+
+#ifdef USE_CONDVAR
 int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr)
 {
 	InitializeConditionVariable(cond);
@@ -67,35 +86,106 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mu)
 	return 0;
 }
 
+int pthread_cond_timedwait(pthread_cond_t * cond, pthread_mutex_t *mutex, const ULONGLONG *tickcount64)
+{
+   const ULONGLONG now = GetTickCount64();
+	
+	if(now > *tickcount64)
+		return 0;
+	
+   ULONGLONG diff = *tickcount64 - now;
+
+   SleepConditionVariableCS(cond, mutex, (DWORD)diff);
+	return 0;
+}
+
 int pthread_cond_destroy(pthread_cond_t *cond)
 {
 	return 0;
 }
 
+
+#else //in case it has to run on WinXP, condition variables aren't supported, have to implement them with oldschool WinAPI calls.
+int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr)
+{ 
+	(*cond) = (pthread_cond_t_*)malloc(sizeof(pthread_cond_t_));
+
+	(*cond)->Broadcast = 0;
+	(*cond)->resetEvent = 0;
+	(*cond)->mu = 0;
+	(*cond)->EV = CreateEvent(NULL, 0, 0, NULL);
+	
+	return 0;
+}
+
+int pthread_cond_signal(pthread_cond_t *cond)
+{
+	SetEvent((*cond)->EV);
+	return 0;
+}
+
+int pthread_cond_broadcast(pthread_cond_t *cond)
+{
+	_InterlockedExchange(&(*cond)->Broadcast, 1);
+	SetEvent((*cond)->EV);
+	
+	return 0;
+}
+
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mu)
+{
+	LeaveCriticalSection(mu);
+	
+	WaitForSingleObject((*cond)->EV, INFINITE);
+	
+	EnterCriticalSection(mu);
+		
+	if((*cond)->Broadcast)
+			SetEvent((*cond)->EV);
+
+	return 0;
+}
+
+int pthread_cond_timedwait(pthread_cond_t * cond, pthread_mutex_t *mutex, const ULONGLONG *tickcount64)
+{
+	LeaveCriticalSection(mutex);
+	
+	const ULONGLONG now = GetTickCount64();
+	
+	ULONGLONG diff = *tickcount64-now;
+	if (diff > now)
+		diff = 0;
+	
+	WaitForSingleObject((*cond)->EV, (DWORD)diff);
+	
+	EnterCriticalSection(mutex);
+		
+	if((*cond)->Broadcast)
+			SetEvent((*cond)->EV);
+
+	return 0;
+
+}
+
+int pthread_cond_destroy(pthread_cond_t *cond)
+{
+	CloseHandle((*cond)->EV);
+	free(*cond);
+	*cond = 0;
+	return 0;
+}
+#endif
+
 int pthread_once(pthread_once_t *once, void (*func)(void))
 {
-	long state = *once;
-
-	_ReadWriteBarrier();
-	
-	while (state != 1)
+	while(*once!=1)
 	{
-		if (!state)
+		if(!InterlockedCompareExchange(once, 2, 0))
 		{
-			if (!InterlockedCompareExchange(once, 2, 0))
-			{
-				func();
-				*once = 1;
-				
-				return 0;
-			}
+			if(*once==2) func(); //consume once to prevent reordering
+			*once=1;
+			return 0;
 		}
-		
-		YieldProcessor();
-		
-		_ReadWriteBarrier();
-		
-		state = *once;
 	}
 	
 	return 0;
